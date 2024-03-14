@@ -1,3 +1,7 @@
+extern crate rusoto_core;
+extern crate rusoto_s3;
+extern crate rusoto_credential;
+
 use ahash::RandomState;
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
@@ -29,7 +33,9 @@ use threadpool::ThreadPool;
 use unicode_segmentation::UnicodeSegmentation;
 
 
-
+/************************************************
+ *                ARGUMENTS    
+ * **********************************************/
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -128,16 +134,11 @@ struct Args {
     output_directory: PathBuf,
 }
 
-fn tokenize(s: &str) -> impl Iterator<Item = &str> {
-    s.split_word_bounds().filter(|w| {
-        for c in w.chars() {
-            if !c.is_whitespace() {
-                return true;
-            }
-        }
-        false
-    })
-}
+
+/************************************************
+ *                Bloom filter stuff     
+ * **********************************************/
+
 
 struct BloomFilter {
     bits: Vec<AtomicU32>,
@@ -384,24 +385,6 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
 }
 
 
-fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files = vec![];
-    for path in paths {
-        if path.is_dir() {
-            let path_str = path
-                .to_str()
-                .ok_or_else(|| anyhow!("invalid path '{}'", path.to_string_lossy()))?;
-            for entry in glob(&format!("{}/**/*.json*.gz", path_str))? {
-                files.push(entry?.to_path_buf());
-            }
-        } else {
-            files.push(path.clone());
-        }
-    }
-
-    Ok(files)
-}
-
 
 #[allow(clippy::too_many_arguments)] // TODO : abstract parameters into a struct
 fn process_file(
@@ -539,6 +522,49 @@ fn process_file(
     }
     Ok(())
 }
+
+fn tokenize(s: &str) -> impl Iterator<Item = &str> {
+    s.split_word_bounds().filter(|w| {
+        for c in w.chars() {
+            if !c.is_whitespace() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+
+
+/************************************************
+ *                I/O stuff     
+ * **********************************************/
+
+
+
+
+fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = vec![];
+    for path in paths {
+        if path.is_dir() {
+            let path_str = path
+                .to_str()
+                .ok_or_else(|| anyhow!("invalid path '{}'", path.to_string_lossy()))?;
+            for entry in glob(&format!("{}/**/*.json*.gz", path_str))? {
+                files.push(entry?.to_path_buf());
+            }
+        } else {
+            files.push(path.clone());
+        }
+    }
+
+    Ok(files)
+}
+
+
+/************************************************
+ *                Main Function      
+ * **********************************************/
 
 fn main() {
     let args = Args::parse();

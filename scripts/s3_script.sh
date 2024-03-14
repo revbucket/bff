@@ -84,7 +84,7 @@ echo "NGRAMS $expected_ngrams"
 # =           Actually run bff                         =
 # ======================================================
 rm -f filter.bff # Always rebuilds the filter froms scratch 
-target/release/bff --bloom-filter-file filter.bff --expected-ngram-count $expected_ngrams --fp-rate $fp_rate --output-directory $output_files $input_files
+target/release/bff --bloom-filter-file filter.bff --expected-ngram-count $expected_ngrams --fp-rate $fp_rate --output-directory $output_files --no-save-bloom-filter $input_files 
 
 # ==================================================
 # =           And then upload back to S3           =

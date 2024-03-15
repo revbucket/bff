@@ -1,7 +1,3 @@
-extern crate rusoto_core;
-extern crate rusoto_s3;
-extern crate rusoto_credential;
-
 use ahash::RandomState;
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
@@ -16,12 +12,15 @@ use rand::Rng;
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs;
+use std::fs::{OpenOptions, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
+use std::process::{Command};
+use std::string::String;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant};
@@ -29,13 +28,14 @@ use std::thread::available_parallelism;
 use sysinfo::{
     System,
 };
+use tokio::task::JoinSet;
 use threadpool::ThreadPool;
 use unicode_segmentation::UnicodeSegmentation;
 
 
-/************************************************
- *                ARGUMENTS    
- * **********************************************/
+/*=================================================
+=                    Arguments                    =
+=================================================*/
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -132,13 +132,40 @@ struct Args {
     /// in this directory.
     #[arg(long, short = 'o')]
     output_directory: PathBuf,
+
+
+    ////////////////
+    // Hacky S3 stuff:
+    // Need:
+    // - groupfile 
+    // - path within bucket 
+    // - location of temp dir 
+    // - output directory 
+    ///////////
+
+
+    /// Path within bucket. Basically the prefix of the s3 items
+    #[arg(long)]
+    path_within_bucket: String,
+
+    /// Groupfile
+    #[arg(long, short='g')]
+    groupfile: PathBuf,
+
+    /// Temp dir
+    #[arg(long)]
+    temp_dir: PathBuf,
+
+    /// s3 output directory
+    #[arg(long)]
+    s3_output: PathBuf,
+
 }
 
 
-/************************************************
- *                Bloom filter stuff     
- * **********************************************/
-
+/*===================================================
+=                     Bloom Filter stuff            =
+===================================================*/
 
 struct BloomFilter {
     bits: Vec<AtomicU32>,
@@ -536,12 +563,10 @@ fn tokenize(s: &str) -> impl Iterator<Item = &str> {
 
 
 
-/************************************************
- *                I/O stuff     
- * **********************************************/
 
-
-
+/*========================================================
+=                       I/O Stuff                        =
+========================================================*/
 
 fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = vec![];
@@ -557,16 +582,202 @@ fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             files.push(path.clone());
         }
     }
-
     Ok(files)
 }
+
+
+fn gather_groups(path_within_bucket: String, groupfile: PathBuf) -> Vec<Vec<String>> {
+    let file = File::open(groupfile).expect("Failed to open file!");
+    let reader = BufReader::new(file);
+
+    let parsed_data: Vec<Vec<String>> = reader
+        .lines()
+        .flatten()
+        .map(|line| line.split(',').map(|s| 
+            format!("{}{}", path_within_bucket, s.to_string())).collect())
+        .collect();
+    parsed_data
+}
+
+
+fn clear_dir(dir_path: &PathBuf) {
+    // Creates directory dir if it doesn't exist
+    // Deletes all contents from dir if it does
+
+    // Create the directory if it doesn't exist
+    if !dir_path.exists() {
+        fs::create_dir_all(dir_path)
+            .expect("Failed to create directory");
+        println!("Directory created: {:?}", dir_path);
+    } else {
+        // Delete all contents of the directory
+        remove_dir_contents(&dir_path)
+            .expect("Failed to remove directory contents");
+        println!("Directory contents removed: {:?}", dir_path);
+    }}
+
+
+
+fn remove_dir_contents(dir_path_buf: &PathBuf) -> std::io::Result<()> {
+    let dir_path: &Path = dir_path_buf.as_ref();
+    for entry in fs::read_dir(dir_path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+
+        if entry_path.is_dir() {
+            remove_dir_contents(&entry_path)?;
+            fs::remove_dir_all(entry_path)?;
+        } else {
+            fs::remove_file(entry_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn aws_s3_cp_group(group: &Vec<String>, output_loc: &PathBuf) {
+    let mut join_set = JoinSet::new();
+    let output_loc_string : String = output_loc.display().to_string();
+    for inner_el in group {
+        let child = Command::new("aws")
+            .arg("s3")
+            .arg("cp")
+            .arg(inner_el)
+            .arg(output_loc_string.clone())
+            .spawn().expect("Failed to spawn!");
+        join_set.spawn(async move {
+            child.wait_with_output().expect("Failed to finish task!");
+        });
+    }
+
+    let mut completed = 0;
+    while completed < group.len() {
+        if let Some(_res) = join_set.join_next().await {
+            completed = completed + 1;
+        }
+    }
+}
+
+/*=============================================================
+=                    Main function part 2                     =
+=============================================================*/
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    // Initialize {Basic things}
+    let threads = if args.threads == 0 {
+        available_parallelism().unwrap().get()
+    } else {
+        args.threads
+    };
+    let now = Instant::now();
+
+
+        // Initialize groups 
+    let groups = gather_groups(args.path_within_bucket, args.groupfile);
+    println!("GROUPS {:?}", groups);
+    // Initialize bloom filter
+    let mut bloom_filter_size = args.bloom_filter_size;
+    let bloom_filter = if args.bloom_filter_file.exists() {
+        println!("Loading bloom filter from {:?}...", args.bloom_filter_file);
+        BloomFilter::from_file(&args.bloom_filter_file).unwrap()
+    } else {
+        println!("Creating new bloom filter...");
+        if args.bloom_filter_size == 0 {
+            bloom_filter_size = compute_bloom_size(args.fp_rate, args.expected_ngram_count);
+        }
+        let num_hashers = BloomFilter::optimal_number_of_hashers(
+            bloom_filter_size,
+            args.expected_ngram_count,
+        );
+        BloomFilter::new(bloom_filter_size, num_hashers)
+    };
+    let bloom_filter = Arc::new(bloom_filter);
+    println!(
+        "\t...Bloom filter loaded. ({} hashers) ({} seconds)",
+        bloom_filter.hash_builders.len(), now.elapsed().as_secs()
+    );
+
+    let p = bloom_filter.my_prob_of_false_positive(args.expected_ngram_count);
+    if p >= 0.5 {
+        println!(
+            "WARNING: Probability of a false positive after {} elements is {}.",
+            args.expected_ngram_count, p
+        );
+    } else {
+        println!(
+            "Probability of a false positive after {} elements: {}",
+            args.expected_ngram_count, p
+        );
+    }
+
+    println!("Bloom filter size is {} ", human_bytes(bloom_filter.size_in_bytes() as f64));
+
+
+    // Then loop over groups
+    for group in &groups {
+        println!("WORKING ON GROUP {:?}", group);
+        // First clean up the temp directory and download the group of s3 files
+        clear_dir(&args.temp_dir);
+        let temp_input_dir = args.temp_dir.join("input/");
+        let temp_output_dir = args.temp_dir.join("output/");
+        match fs::create_dir(&temp_output_dir) {
+            Ok(_) => (),
+            Err(err) => eprintln!("Error creating directory: {}",err),
+        }
+        aws_s3_cp_group(&group, &temp_input_dir).await;
+        // Then loop over all the files and wait until done processing
+        let threadpool = ThreadPool::new(threads);
+        if let Ok(inputs) = fs::read_dir(temp_input_dir) {
+            for input in inputs {
+                if let Ok(input) = input {
+                    let path_buf: PathBuf = input.path();
+                    let mut output = temp_output_dir.clone();
+                    output.push(input.file_name());
+                    println!("I/O {:?}, {:?}", path_buf, output);
+
+                    process_file(
+                        &path_buf,
+                        &output,
+                        &bloom_filter,
+                        args.max_ngram_size,
+                        args.min_ngram_size,
+                        !args.no_update_bloom_filter,
+                        args.filtering_threshold,
+                        args.annotate_only,
+                        args.annotate_attribute_only,
+                        args.whole_document,
+                        args.whole_paragraphs,
+                        &None,
+                    )
+                    .unwrap();                    
+                }
+            }
+        }
+        threadpool.join();        
+        let to_upload_files = expand_dirs(&[args.temp_dir.join("output")]).unwrap();        
+        println!("TO UPLOAD, {:?}", to_upload_files);
+        let to_upload_files = to_upload_files.into_iter().map(|s| s.display().to_string()).collect();
+        aws_s3_cp_group(&to_upload_files, &args.s3_output).await;
+        println!("FINISHED ONE LOOP!");
+
+    }
+
+    // And finally upload the temp directory to s3 
+
+
+}
+
+
+
 
 
 /************************************************
  *                Main Function      
  * **********************************************/
 
-fn main() {
+fn main_dep() {
     let args = Args::parse();
     let inputs = expand_dirs(&args.inputs).unwrap();
     println!("Parsed {:?} input files...", inputs.len());

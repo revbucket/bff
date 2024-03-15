@@ -19,7 +19,4 @@ human_bytes = "0.4.3"
 indicatif = "0.17.8"
 glob = "0.3.1"
 anyhow = "1.0.80"
-rusoto_s3 = "0.48.0"
-rusoto_core = "0.48.0"
-rusoto_credential = "0.48.0"
-tokio="*"
+tokio = { version = "1.36.0", features = ["full"] }

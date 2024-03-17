@@ -1,5 +1,5 @@
 use ahash::RandomState;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use byteorder::{LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
 use clap::Parser;
 use flate2::read::MultiGzDecoder;
@@ -16,6 +16,7 @@ use std::fs;
 use std::fs::{OpenOptions, File};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
+use std::io::{Cursor, Read};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::size_of;
 use std::path::{PathBuf, Path};
@@ -31,6 +32,10 @@ use sysinfo::{
 use tokio::task::JoinSet;
 use threadpool::ThreadPool;
 use unicode_segmentation::UnicodeSegmentation;
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{Client};
+use aws_sdk_s3::primitives::ByteStream;
 
 
 /*=================================================
@@ -137,7 +142,8 @@ struct Args {
     ////////////////
     // Hacky S3 stuff:
     // Need:
-    // - groupfile 
+    // - list of input_output file maps
+    // 
     // - path within bucket 
     // - location of temp dir 
     // - output directory 
@@ -146,20 +152,7 @@ struct Args {
 
     /// Path within bucket. Basically the prefix of the s3 items
     #[arg(long)]
-    path_within_bucket: String,
-
-    /// Groupfile
-    #[arg(long, short='g')]
-    groupfile: PathBuf,
-
-    /// Temp dir
-    #[arg(long)]
-    temp_dir: PathBuf,
-
-    /// s3 output directory
-    #[arg(long)]
-    s3_output: PathBuf,
-
+    s3_io: PathBuf    
 }
 
 
@@ -550,6 +543,171 @@ fn process_file(
     Ok(())
 }
 
+
+
+#[allow(clippy::too_many_arguments)] // TODO : abstract parameters into a struct
+async fn process_file_s3(
+    s3_bucket: &String,
+    s3_input: &String,
+    s3_output: &String,
+    bloom_filter: &Arc<BloomFilter>,
+    max_ngram_size: usize,
+    min_ngram_size: usize,
+    update_bloom_filter: bool,
+    filtering_threshold: f64,
+    annotate_only: bool,
+    annotate_attribute_only: bool,
+    whole_document: bool,
+    whole_paragraphs: bool,
+) -> Result<(), Error> {
+
+
+    // Phase 1a: Build s3 client
+    let region_provider = RegionProviderChain::first_try("us-west-2");
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+
+    // Phase 1b: read data into lines
+    println!("S3 INPUT {} {}", s3_bucket, s3_input);
+    let object = client
+        .get_object()
+        .bucket(s3_bucket)
+        .key(s3_input)
+        .send()
+        .await?;
+    let data = object.body.collect().await?;
+    let data = data.into_bytes();
+    let mut gz = MultiGzDecoder::new(&data[..]);
+    let mut input_string = String::new();
+    gz.read_to_string(&mut input_string)?;
+
+    // Phase 1c: Setup output buffer to upload->s3 eventually...
+    let mut output_data = Vec::new();
+    let mut writer = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
+    let mut count = 0;
+
+    for line in input_string.lines() {
+        count += 1;
+        continue;
+        let line = line;
+        let mut data: Value = serde_json::from_str(&line).unwrap();
+        let text = data["text"].as_str().unwrap();
+
+        let newlines = if whole_document {
+            vec![0, text.len()]
+        } else {
+            let mut newlines = Vec::new();
+            newlines.push(0);
+            for i in text.match_indices('\n') {
+                newlines.push(i.0);
+            }
+            newlines.push(text.len());
+            newlines
+        };
+        let mut windows_to_remove = Vec::new();
+        let mut total_contained_ngrams = 0;
+
+        for paragraph_window in newlines.windows(2) {
+            let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
+
+            // calculate hashes for the paragraph
+            let mut hashes: Vec<Vec<u64>> = Vec::new();
+            let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
+            for token in tokenize(paragraph) {
+                ngram.push_back(token);
+                // If not hashing whole paragraphs, add ngrams to the bloom filter as they reach max size
+                if !whole_paragraphs && ngram.len() >= max_ngram_size {
+                    hashes.push(bloom_filter.hashes(&ngram));
+                    ngram.pop_front();
+                }
+            }
+            // If the paragraph was too short, put in a shorter ngram, so we can dedupe short
+            // paragraphs exactly.
+            if hashes.is_empty() && ngram.len() >= min_ngram_size {
+                hashes.push(bloom_filter.hashes(&ngram));
+            }
+
+            let contained_ngrams = hashes
+                .iter()
+                .filter(|ngram| bloom_filter.contains_hashes(ngram))
+                .count();
+            total_contained_ngrams += contained_ngrams;
+
+            // calculate how many ngrams are in the bloom filter
+            let number_of_ngrams = hashes.len();
+
+            // produce output
+            let too_many_duplicate_ngrams =
+                contained_ngrams as f64 / number_of_ngrams as f64 > filtering_threshold;
+            if too_many_duplicate_ngrams {
+                windows_to_remove.push(paragraph_window);
+            } else if update_bloom_filter {
+                for ngram in hashes {
+                    bloom_filter.insert_hashes(&ngram);
+                }
+            }
+        }
+
+        // if annotate_attribute_only or annotate_only, add the annotation to the json
+        if annotate_attribute_only || annotate_only {
+            data["bff_duplicate_spans"] = serde_json::to_value(windows_to_remove).unwrap();
+            data["bff_contained_ngram_count"] =
+                serde_json::to_value(total_contained_ngrams).unwrap();
+        } else {
+            let mut output_paragraphs = String::new();
+            let mut last_end = 0;
+            for paragraph_window in windows_to_remove {
+                output_paragraphs.push_str(&text[last_end..paragraph_window[0]]);
+                last_end = paragraph_window[1];
+            }
+            output_paragraphs.push_str(&text[last_end..]);
+            data["text"] = Value::String(output_paragraphs);
+            data["bff_contained_ngram_count_before_dedupe"] =
+                serde_json::to_value(total_contained_ngrams).unwrap();
+        }
+
+        if annotate_attribute_only {
+            // Allowed fields
+            let allowed_fields = [
+                "bff_duplicate_spans",
+                "bff_contained_ngram_count",
+                "id",
+                "source",
+            ];
+
+            // Iterate through the keys of the JSON object and remove any field that is not in the allowed_fields list
+            if let Value::Object(ref mut map) = data {
+                map.retain(|key, _| allowed_fields.contains(&key.as_str()));
+                }
+            
+        }
+
+        serde_json::to_writer(&mut writer, &data)?;
+        writer.write_all(b"\n")?;
+    }
+    println!("COUNTED {} LINES", count);
+    return Ok(());
+    // to finalize, write to s3
+    writer.finish().unwrap();
+    let bytes_to_upload = ByteStream::from(output_data);
+    client
+        .put_object()
+        .bucket(s3_bucket)
+        .key(s3_output)
+        .body(bytes_to_upload)
+        .send()
+        .await?;
+    println!("COUNT WORKS {}", count);
+    Ok(())
+}
+
+
+
+
 fn tokenize(s: &str) -> impl Iterator<Item = &str> {
     s.split_word_bounds().filter(|w| {
         for c in w.chars() {
@@ -658,6 +816,15 @@ async fn aws_s3_cp_group(group: &Vec<String>, output_loc: &PathBuf) {
     }
 }
 
+fn split_bucket_path(uri: &str) -> Option<(String, String)> {
+
+    if let Some((bucket, path)) = uri.split_once('/') {
+        Some((bucket.to_string(), path.to_string()))
+    } else {
+        None
+    }
+}
+
 /*=============================================================
 =                    Main function part 2                     =
 =============================================================*/
@@ -674,9 +841,7 @@ async fn main() {
     let now = Instant::now();
 
 
-        // Initialize groups 
-    let groups = gather_groups(args.path_within_bucket, args.groupfile);
-    println!("GROUPS {:?}", groups);
+
     // Initialize bloom filter
     let mut bloom_filter_size = args.bloom_filter_size;
     let bloom_filter = if args.bloom_filter_file.exists() {
@@ -715,31 +880,20 @@ async fn main() {
     println!("Bloom filter size is {} ", human_bytes(bloom_filter.size_in_bytes() as f64));
 
 
-    // Then loop over groups
-    for group in &groups {
-        println!("WORKING ON GROUP {:?}", group);
-        // First clean up the temp directory and download the group of s3 files
-        clear_dir(&args.temp_dir);
-        let temp_input_dir = args.temp_dir.join("input/");
-        let temp_output_dir = args.temp_dir.join("output/");
-        match fs::create_dir(&temp_output_dir) {
-            Ok(_) => (),
-            Err(err) => eprintln!("Error creating directory: {}",err),
-        }
-        aws_s3_cp_group(&group, &temp_input_dir).await;
-        // Then loop over all the files and wait until done processing
-        let threadpool = ThreadPool::new(threads);
-        if let Ok(inputs) = fs::read_dir(temp_input_dir) {
-            for input in inputs {
-                if let Ok(input) = input {
-                    let path_buf: PathBuf = input.path();
-                    let mut output = temp_output_dir.clone();
-                    output.push(input.file_name());
-                    println!("I/O {:?}, {:?}", path_buf, output);
 
-                    process_file(
-                        &path_buf,
-                        &output,
+    let io_file = File::open(args.s3_io).expect("Failed to open io file");
+    let reader = BufReader::new(io_file);
+    for line in reader.lines() {
+        if let Ok(line) = line {
+        let parts: Vec<&str> = line.split(',').collect();
+        let input_file = parts[0].replace("s3://", "");
+        let output_file = parts[1].replace("s3://", "");      
+        println!("{} {}", input_file, output_file);
+        let (bucket, input_path) = split_bucket_path(&input_file).unwrap();
+        let (_, output_path) = split_bucket_path(&output_file).unwrap();
+
+        process_file_s3(&bucket, &input_path, 
+                        &output_path,
                         &bloom_filter,
                         args.max_ngram_size,
                         args.min_ngram_size,
@@ -749,20 +903,11 @@ async fn main() {
                         args.annotate_attribute_only,
                         args.whole_document,
                         args.whole_paragraphs,
-                        &None,
                     )
-                    .unwrap();                    
-                }
-            }
-        }
-        threadpool.join();        
-        let to_upload_files = expand_dirs(&[args.temp_dir.join("output")]).unwrap();        
-        println!("TO UPLOAD, {:?}", to_upload_files);
-        let to_upload_files = to_upload_files.into_iter().map(|s| s.display().to_string()).collect();
-        aws_s3_cp_group(&to_upload_files, &args.s3_output).await;
-        println!("FINISHED ONE LOOP!");
-
+                    .await.unwrap();             
+        }   
     }
+
 
     // And finally upload the temp directory to s3 
 

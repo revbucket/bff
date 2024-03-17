@@ -883,16 +883,27 @@ async fn main() {
 
     let io_file = File::open(args.s3_io).expect("Failed to open io file");
     let reader = BufReader::new(io_file);
-    for line in reader.lines() {
-        if let Ok(line) = line {
-        let parts: Vec<&str> = line.split(',').collect();
-        let input_file = parts[0].replace("s3://", "");
-        let output_file = parts[1].replace("s3://", "");      
-        println!("{} {}", input_file, output_file);
-        let (bucket, input_path) = split_bucket_path(&input_file).unwrap();
-        let (_, output_path) = split_bucket_path(&output_file).unwrap();
+    let threadpool = ThreadPool::new(threads);
 
-        process_file_s3(&bucket, &input_path, 
+    for line in reader.lines() {
+        let bloom_filter = bloom_filter.clone();
+
+        threadpool.execute(move || {
+
+
+
+
+            if let Ok(line) = line {
+                let parts: Vec<&str> = line.split(',').collect();
+                let input_file = parts[0].replace("s3://", "");
+                let output_file = parts[1].replace("s3://", "");      
+                println!("{} {}", input_file, output_file);
+                let (bucket, input_path) = split_bucket_path(&input_file).unwrap();
+                let (_, output_path) = split_bucket_path(&output_file).unwrap();
+
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let res = rt.block_on(
+                    process_file_s3(&bucket, &input_path, 
                         &output_path,
                         &bloom_filter,
                         args.max_ngram_size,
@@ -903,10 +914,18 @@ async fn main() {
                         args.annotate_attribute_only,
                         args.whole_document,
                         args.whole_paragraphs,
-                    )
-                    .await.unwrap();             
-        }   
+                        )
+                        );   
+                }
+            });
+
+
+
+          
+           
     }
+    threadpool.join();
+    
 
 
     // And finally upload the temp directory to s3 

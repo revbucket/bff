@@ -382,7 +382,7 @@ impl BloomFilter {
         } else {
             println!("Creating new bloom filter...");
             if bff_args.bloom_filter_size == 0 {
-                bloom_filter_size = compute_bloom_size(bff_args.fp_rate, bff_args.expected_ngram_count);
+                bloom_filter_size = compute_bloom_size(bff_args.fp_rate, bff_args.expected_ngram_count, true);
             }
             let num_hashers = BloomFilter::optimal_number_of_hashers(
                 bloom_filter_size,
@@ -402,7 +402,7 @@ impl BloomFilter {
 
 
 
-fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
+fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: bool) -> usize {
     /* Uses binary search to find optimal size of bloom filter using optimal number of hashers
        and provided ngram counts
     */
@@ -412,10 +412,16 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
 
 
     let mut lo = 1 as usize;
-    let mut hi = ((sys.total_memory() as f64) * 0.9) as usize;
+
+    let mut hi = if limit_to_sys {
+                    ((sys.total_memory() as f64) * 0.9) as usize
+                 } else {
+                    420_744_073_709_551_615 as usize
+                 };
+
 
     // Save some time by checking endpoint first
-    if BloomFilter::prob_of_false_positive(hi, expected_ngram_count, 
+    if limit_to_sys && BloomFilter::prob_of_false_positive(hi, expected_ngram_count, 
                                            BloomFilter::optimal_number_of_hashers(hi, expected_ngram_count)) > fp_rate {
         println!(
             "WARNING: To achieve desired false-positive rate, you'd need >90% of system RAM. Defaulting to 90% \
@@ -742,7 +748,7 @@ async fn main() -> std::io::Result<()> {
             bff_s3(s3io, &bff_args).await?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
-            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count);
+            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
             println!("To handle {} tokens with fp rate {}, you'd need a filter of size {}",
                      expected_ngram_count, fp_rate, human_bytes(bff_size as f64));
         }

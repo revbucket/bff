@@ -12,7 +12,7 @@ use rand::Rng;
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
-use std::fs::{OpenOptions, File};
+use std::fs::{OpenOptions, File, remove_file};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::io::{Cursor, Read};
@@ -156,7 +156,15 @@ enum Commands {
 
         #[command(flatten)]
         bff_args: BffArgs
+    },
+
+    Sysreq {
+        #[arg(required=true, long)]
+        expected_ngram_count: usize,
+        #[arg(required=true, long)]
+        fp_rate: f64
     }
+
 }
 
 
@@ -435,7 +443,7 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     input_file: &PathBuf,
-    output_file: &PathBuf,
+    output_file_path: &PathBuf,
     bloom_filter: &Arc<BloomFilter>,
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
@@ -449,12 +457,13 @@ fn process_file(
         .open(input_file)?;
     let reader = BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file));
 
+
     let output_file = OpenOptions::new()
         .read(false)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(output_file)?;
+        .open(output_file_path)?;
     let mut writer = BufWriter::with_capacity(
         1024 * 1024,
         GzEncoder::new(output_file, Compression::default()),
@@ -462,11 +471,25 @@ fn process_file(
 
 
     // Loop over lines and do BFF stuff
+    let mut count = 0;
+    let mut fully_skipped = 0;
     for line in reader.lines() {
+        count += 1;
         let dedup_data = process_line(&line.unwrap(), &bloom_filter, &bff_args);
-        serde_json::to_writer(&mut writer, &dedup_data)?;
-        writer.write_all(b"\n")?;
+        if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
+            fully_skipped += 1;
+        }
+        else {
+            serde_json::to_writer(&mut writer, &dedup_data)?;
+            writer.write_all(b"\n")?;             
+        }        
     }
+
+    if count == fully_skipped {
+        remove_file(output_file_path)?;
+    }
+
+
     match pbar_option {
         Some(pbar) => pbar.lock().unwrap().inc(1),
         None => (),
@@ -514,23 +537,35 @@ async fn process_file_s3(
     let mut writer = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
 
     let mut count = 0;
+    let mut fully_skipped = 0;
     for line in input_string.lines() {
         count += 1;
         let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
-        serde_json::to_writer(&mut writer, &dedup_data)?;
-        writer.write_all(b"\n")?;
+        if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
+            fully_skipped += 1;
+        }
+        else {
+            serde_json::to_writer(&mut writer, &dedup_data)?;
+            writer.write_all(b"\n")?;             
+        }
+        
     }
     println!("Number of lines in {:?} is {}", s3_input, count);
+
+
     // to finalize, write to s3
     writer.finish().unwrap();
-    let bytes_to_upload = ByteStream::from(output_data);
-    client
-        .put_object()
-        .bucket(s3_bucket)
-        .key(s3_output)
-        .body(bytes_to_upload)
-        .send()
-        .await?;
+
+    if fully_skipped < count {
+        let bytes_to_upload = ByteStream::from(output_data);
+        client
+            .put_object()
+            .bucket(s3_bucket)
+            .key(s3_output)
+            .body(bytes_to_upload)
+            .send()
+            .await?;
+    }
     match pbar_option {
         Some(pbar) => pbar.lock().unwrap().inc(1),
         None => (),
@@ -684,6 +719,12 @@ fn split_bucket_path(uri: &str) -> Option<(String, String)> {
 
 
 
+async fn list_s3_objects(bucket: &str, prefix: &str) {
+    ();
+}
+
+
+
 /*=============================================================
 =                       Main Function                         =
 =============================================================*/
@@ -697,7 +738,13 @@ async fn main() -> std::io::Result<()> {
             bff(inputs, output_directory, &bff_args)?;
         },
         Commands::BffRemote {s3io, bff_args} => {
+            println!("NSBF {:?}", bff_args.no_save_bloom_filter);
             bff_s3(s3io, &bff_args).await?;
+        }
+        Commands::Sysreq {expected_ngram_count, fp_rate} => {
+            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count);
+            println!("To handle {} tokens with fp rate {}, you'd need a filter of size {}",
+                     expected_ngram_count, fp_rate, human_bytes(bff_size as f64));
         }
     }
     Ok(())
@@ -878,7 +925,5 @@ async fn bff_s3(s3_io: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
     println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
     Ok(())
 }
-
-
 
 

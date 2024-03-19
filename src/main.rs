@@ -2,7 +2,7 @@ use ahash::RandomState;
 use anyhow::{anyhow, Result, Error};
 use byteorder::{LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
 use clap::{Args, Parser, Subcommand};
-use flate2::read::MultiGzDecoder;
+use flate2::read::{MultiGzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use glob::glob;
@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::fs::{OpenOptions, remove_file};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
-use std::io::{Cursor, Read};
+use std::io::{Cursor};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::size_of;
 use std::path::{PathBuf};
@@ -33,6 +33,13 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{Client};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
+
+
+use tokio::io::{AsyncBufReadExt};
+use tokio::io::BufReader as tBufReader;
+use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
+
 
 
 
@@ -521,7 +528,7 @@ async fn process_file_s3(
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
 ) -> Result<(), Error> {
-
+    //
 
     // Phase 1a: Build s3 client
     let region_provider = RegionProviderChain::first_try("us-west-2");
@@ -533,25 +540,29 @@ async fn process_file_s3(
 
 
     // Phase 1b: read data into lines
-    let object = client
+    // Note: this reads in a streaming sense (but we don't upload in streaming)
+    let object: GetObjectOutput = client
         .get_object()
         .bucket(s3_bucket)
         .key(s3_input)
         .send()
         .await?;
-    let s3_data = object.body.collect().await?;
-    let s3_data = s3_data.into_bytes();
-    let mut gz = MultiGzDecoder::new(&s3_data[..]);
-    let mut input_string = String::new();
-    gz.read_to_string(&mut input_string)?;
+
+    let body_stream = object.body.into_async_read();
+    let gz = asyncGZ::new(body_stream);
+    let reader = tBufReader::new(gz);
+    let mut lines_iter = reader.lines();
 
     // Phase 1c: Setup output buffer to upload->s3 eventually...
+    // TODO: Make output writer streaming too?
     let mut output_data = Vec::new();
     let mut writer = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
 
+
+    // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
     let mut count = 0;
     let mut fully_skipped = 0;
-    for line in input_string.lines() {
+    while let Some(line) = lines_iter.next_line().await? {
         count += 1;
         let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
         if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
@@ -566,9 +577,8 @@ async fn process_file_s3(
     println!("Number of lines in {:?} is {}", s3_input, count);
 
 
-    // to finalize, write to s3
+    // Phase 3: to finalize, write to s3 if there's something to write
     writer.finish().unwrap();
-
     if fully_skipped < count {
         let bytes_to_upload = ByteStream::from(output_data);
         client
@@ -583,7 +593,7 @@ async fn process_file_s3(
         Some(pbar) => pbar.lock().unwrap().inc(1),
         None => (),
     }
-
+    
     Ok(())
 }
 
@@ -742,7 +752,6 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Ve
         .into_paginator()
         .send();
 
-
     let mut io_pairs: Vec<Vec<String>> = Vec::new();
     while let Some(result) = response.next().await {
         match result {
@@ -793,7 +802,6 @@ async fn main() -> std::io::Result<()> {
 
 
 fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
-
     /*
     General pseudocode:
     Setup:
@@ -805,9 +813,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     Finalize:
         - Write bff if needed
     */
-
     // SETUP PHASE
-
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
     let all_inputs = expand_dirs(inputs).unwrap();
@@ -876,7 +882,6 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 
 
 async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bff_args: &BffArgs) -> std::io::Result<()> {
-
     /*
     General pseudocode:
     Setup:
@@ -888,7 +893,6 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     Finalize:
         - Write bff if needed
     */
-
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
 
@@ -908,14 +912,12 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     }
     println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
 
-
     let threads = if bff_args.threads == 0 {
         available_parallelism().unwrap().get()
     } else {
         bff_args.threads
     };    
     let threadpool = ThreadPool::new(threads);
-
     for io_pair in &io_pairs {
         let bucket = bucket.clone();
         let bloom_filter = bloom_filter.clone();
@@ -943,8 +945,6 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
                 let mut count = err_count.lock().unwrap();
                 *count += 1;
             }
-
-            
         
         });
         

@@ -531,7 +531,7 @@ async fn process_file_s3(
     //
 
     // Phase 1a: Build s3 client
-    let region_provider = RegionProviderChain::first_try("us-west-2");
+    let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()
@@ -738,7 +738,7 @@ fn extract_s3_basename(input_path: &str) -> &str {
 
 
 async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Vec<Vec<String>>, Error> {
-    let region_provider = RegionProviderChain::first_try("us-west-2");
+    let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()

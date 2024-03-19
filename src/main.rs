@@ -12,7 +12,7 @@ use rand::Rng;
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
-use std::fs::{OpenOptions, File, remove_file};
+use std::fs::{OpenOptions, remove_file};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::io::{Cursor, Read};
@@ -123,7 +123,7 @@ struct BffArgs{
 enum Commands {
     /* Two commands here: 
       - `bff` is for LOCAL files (local in -> local out)
-      - `bff_s3` is for S3 files (S3 in -> S3 out)
+      - `bff_remote` is for S3 files (S3 in -> S3 out)
     Where each takes default arguments of: 
 
 
@@ -132,9 +132,10 @@ enum Commands {
         + inputs: file or files (directories okay) of gzip compressed newline-delimited JSON files with a 'text' field
         + output_directory: where the deduplicated files get loaded to
     
-    -- bff_s3:
-        + s3_io_file: file where each line is like "s3://bucket/path/to/input.jsonl.gz,s3://bucket/path/to/output.jsonl.gz"
-                      which explicitly lists all input files and where they should go once deduped
+    -- bff_remote:
+        + bucket
+        + input_dir
+        + output_dir
     */
 
     #[clap(arg_required_else_help = true)]
@@ -152,7 +153,13 @@ enum Commands {
 
     BffRemote {
         #[arg(required=true, long)]
-        s3io: PathBuf,
+        bucket: String,
+
+        #[arg(required=true, long)]
+        input_dir: String,
+
+        #[arg(required=true, long)]
+        output_dir: String,
 
         #[command(flatten)]
         bff_args: BffArgs
@@ -163,7 +170,7 @@ enum Commands {
         expected_ngram_count: usize,
         #[arg(required=true, long)]
         fp_rate: f64
-    }
+    },
 
 }
 
@@ -714,21 +721,50 @@ fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 
-fn split_bucket_path(uri: &str) -> Option<(String, String)> {
+fn extract_s3_basename(input_path: &str) -> &str {
+    let parts: Vec<&str> = input_path.split('/').collect();
+    parts.last().unwrap()
+}
 
-    if let Some((bucket, path)) = uri.split_once('/') {
-        Some((bucket.to_string(), path.to_string()))
-    } else {
-        None
+
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Vec<Vec<String>>, Error> {
+    let region_provider = RegionProviderChain::first_try("us-west-2");
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let mut response = client
+        .list_objects_v2()    
+        .bucket(bucket.to_owned())
+        .prefix(prefix.to_owned())
+        .into_paginator()
+        .send();
+
+
+    let mut io_pairs: Vec<Vec<String>> = Vec::new();
+    while let Some(result) = response.next().await {
+        match result {
+            Ok(output) => {
+                for object in output.contents() {
+                    let input_key = object.key().unwrap();
+                    if !(input_key.ends_with(".jsonl.gz") || input_key.ends_with(".json.gz")) {
+                        continue;
+                    }
+                    let basename = extract_s3_basename(&input_key);
+                    let output_key = format!("{}{}", output_dir, basename).to_string(); 
+                    let io_pair = vec![String::from(input_key), String::from(&output_key)];
+                    io_pairs.push(io_pair);                 
+                }
+            }
+            Err(err) => {
+                eprintln!("{err:?}")
+            }
+        }
     }
+    Ok(io_pairs)
 }
-
-
-
-async fn list_s3_objects(bucket: &str, prefix: &str) {
-    ();
-}
-
 
 
 /*=============================================================
@@ -743,15 +779,14 @@ async fn main() -> std::io::Result<()> {
         { 
             bff(inputs, output_directory, &bff_args)?;
         },
-        Commands::BffRemote {s3io, bff_args} => {
-            println!("NSBF {:?}", bff_args.no_save_bloom_filter);
-            bff_s3(s3io, &bff_args).await?;
+        Commands::BffRemote {bucket, input_dir, output_dir, bff_args} => {
+            bff_remote(bucket, input_dir, output_dir, &bff_args).await?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
             println!("To handle {} tokens with fp rate {}, you'd need a filter of size {}",
                      expected_ngram_count, fp_rate, human_bytes(bff_size as f64));
-        }
+        },
     }
     Ok(())
 }
@@ -840,7 +875,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 }
 
 
-async fn bff_s3(s3_io: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bff_args: &BffArgs) -> std::io::Result<()> {
 
     /*
     General pseudocode:
@@ -856,11 +891,12 @@ async fn bff_s3(s3_io: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
 
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
-    let io_file = File::open(s3_io).expect("Failed to open io file");
-    let num_files = std::fs::read_to_string(s3_io).unwrap().lines().count() as u64;
+
+    let io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
+
+    let num_files = io_pairs.len();
     let err_count = Arc::new(Mutex::new(0));
-    let reader = BufReader::new(io_file);
-    let pbar = ProgressBar::new(num_files)
+    let pbar = ProgressBar::new(num_files as u64)
         .with_style(
             ProgressStyle::with_template(
                 "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
@@ -880,7 +916,8 @@ async fn bff_s3(s3_io: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
     };    
     let threadpool = ThreadPool::new(threads);
 
-    for line in reader.lines() {
+    for io_pair in &io_pairs {
+        let bucket = bucket.clone();
         let bloom_filter = bloom_filter.clone();
         let bff_args = bff_args.clone();
         let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
@@ -889,37 +926,30 @@ async fn bff_s3(s3_io: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
         } else {
             Some(pbar.clone())
         };
+        let input_path = io_pair[0].clone();
+        let output_path = io_pair[1].clone();
 
-        if let Ok(line) = line {
-            let parts: Vec<&str> = line.split(',').collect();
-            let input_file = parts[0].replace("s3://", "");
-            let output_file = parts[1].replace("s3://", "");      
-            let (bucket, input_path) = split_bucket_path(&input_file).unwrap();
-            let (_, output_path) = split_bucket_path(&output_file).unwrap();
+        threadpool.execute(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Err(err) = rt.block_on(
+                process_file_s3(&bucket, 
+                    &input_path, 
+                    &output_path,
+                    &bloom_filter,
+                    &bff_args, 
+                    &pbar_option)
+                ) {
+                eprintln!("Error processing {}; {:?}", input_path, err);
+                let mut count = err_count.lock().unwrap();
+                *count += 1;
+            }
 
-        
-            threadpool.execute(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                if let Err(err) = rt.block_on(
-                    process_file_s3(&bucket, 
-                        &input_path, 
-                        &output_path,
-                        &bloom_filter,
-                        &bff_args, 
-                        &pbar_option)
-                    ) {
-                    eprintln!("Error processing {}; {:?}", input_path, err);
-                    let mut count = err_count.lock().unwrap();
-                    *count += 1;
-                }
-
-                
             
-            });
-        }
+        
+        });
+        
     }
     threadpool.join();
-
     // FINALIZE PHASE 
     if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
         let write_start_time = Instant::now();

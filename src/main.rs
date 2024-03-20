@@ -123,18 +123,6 @@ struct BffArgs{
     #[arg(long, short = 't', default_value_t = 0)]
     threads: usize,    
 
-
-    /// PROFILE ARGS (REMOVE LATER)
-    #[arg(long, default_value_t = false)]
-    count_lines_only: bool,
-
-    #[arg(long, default_value_t = false)]
-    fully_download_s3: bool,
-
-    #[arg(long, default_value_t= 0)]
-    limit_files: usize,
-
-
 }
 
 
@@ -533,7 +521,7 @@ fn process_file(
 
 
 
-async fn process_file_s3_stream(
+async fn process_file_s3(
     s3_bucket: &String,
     s3_input: &String,
     s3_output: &String,
@@ -564,7 +552,7 @@ async fn process_file_s3_stream(
 
     let body_stream = object.body.into_async_read();
     let gz = asyncGZ::new(body_stream);
-    let reader = tBufReader::new(gz);
+    let reader = tBufReader::with_capacity(1024 * 1024, gz);
     let mut lines_iter = reader.lines();
 
     // Phase 1c: Setup output buffer to upload->s3 eventually...
@@ -579,10 +567,6 @@ async fn process_file_s3_stream(
     let mut fully_skipped = 0;
     while let Some(line) = lines_iter.next_line().await? {
         count += 1;
-        if bff_args.count_lines_only { // REMOVE THIS BLOCK WHEN WE REMOVE count_lines_only arg
-            fully_skipped += 1;
-            continue;
-        }
         let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
         if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
             fully_skipped += 1;
@@ -618,95 +602,6 @@ async fn process_file_s3_stream(
     
     Ok(())
 }
-
-
-
-async fn process_file_s3_download(
-    s3_bucket: &String,
-    s3_input: &String,
-    s3_output: &String,
-    bloom_filter: &Arc<BloomFilter>,
-    bff_args: &BffArgs,
-    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
-) -> Result<(), Error> {
-    //
-
-    // Phase 1a: Build s3 client
-    let region_provider = RegionProviderChain::default_provider();
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-    let client = Client::new(&config);
-
-
-    // Phase 1b: read data into lines
-    // Note: this reads in a streaming sense (but we don't upload in streaming)
-    let object: GetObjectOutput = client
-        .get_object()
-        .bucket(s3_bucket)
-        .key(s3_input)
-        .send()
-        .await?;
-
-
-    let body_stream = object.body.into_async_read();
-    let gz = asyncGZ::new(body_stream);
-    let reader = tBufReader::new(gz);
-    let mut lines_iter = reader.lines();
-
-    // Phase 1c: Setup output buffer to upload->s3 eventually...
-    // TODO: Make output writer streaming too?
-    let mut output_data = Vec::new();
-    let encoder = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
-    let mut buf_writer = BufWriter::with_capacity(1024 * 1024, encoder);
-
-
-    // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
-    let mut count = 0;
-    let mut fully_skipped = 0;
-    while let Some(line) = lines_iter.next_line().await? {
-        count += 1;
-        if bff_args.count_lines_only { // REMOVE THIS BLOCK WHEN WE REMOVE count_lines_only arg
-            fully_skipped += 1;
-            continue;
-        }
-        let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
-        if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
-            fully_skipped += 1;
-        }
-        else {
-            serde_json::to_writer(&mut buf_writer, &dedup_data)?;
-            buf_writer.write_all(b"\n")?;          
-        }
-        
-    }
-    println!("Number of lines in {:?} is {}", s3_input, count);
-
-
-    // Phase 3: to finalize, write to s3 if there's something to write
-    buf_writer.flush()?;
-    let encoder = buf_writer.into_inner().expect("Failed to get encoder");
-    encoder.finish().unwrap();
-
-    if fully_skipped < count {
-        let bytes_to_upload = ByteStream::from(output_data);
-        client
-            .put_object()
-            .bucket(s3_bucket)
-            .key(s3_output)
-            .body(bytes_to_upload)
-            .send()
-            .await?;
-    }
-    match pbar_option {
-        Some(pbar) => pbar.lock().unwrap().inc(1),
-        None => (),
-    }
-    
-    Ok(())
-}
-
 
 
 
@@ -1008,11 +903,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     */
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
-
-    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
-    if bff_args.limit_files > 0 && io_pairs.len() > bff_args.limit_files {
-        io_pairs.truncate(bff_args.limit_files);
-    }
+    let io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
 
 
     let num_files = io_pairs.len();
@@ -1051,11 +942,10 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
         let output_path = io_pair[1].clone();
 
 
-        if bff_args.fully_download_s3 {
-            threadpool.execute(move || {
+        threadpool.execute(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     if let Err(err) = rt.block_on(
-                        process_file_s3_download(&bucket, 
+                        process_file_s3(&bucket, 
                             &input_path, 
                             &output_path,
                             &bloom_filter,
@@ -1067,26 +957,9 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
                         *count += 1;
                     }
                 
-                });
-        } else {
-            threadpool.execute(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        if let Err(err) = rt.block_on(
-                            process_file_s3_stream(&bucket, 
-                                &input_path, 
-                                &output_path,
-                                &bloom_filter,
-                                &bff_args, 
-                                &pbar_option)
-                            ) {
-                            eprintln!("Error processing {}; {:?}", input_path, err);
-                            let mut count = err_count.lock().unwrap();
-                            *count += 1;
-                        }
-                    
-                    });            
+                });            
 
-        }
+        
         
     }
     threadpool.join();

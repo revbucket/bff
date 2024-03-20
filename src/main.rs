@@ -468,7 +468,7 @@ fn process_file(
     bloom_filter: &Arc<BloomFilter>,
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
-) -> Result<(), io::Error> {
+) -> Result<(usize, usize), io::Error> {
 
     // Setup input/output writers
     let input_file = OpenOptions::new()
@@ -494,9 +494,14 @@ fn process_file(
     // Loop over lines and do BFF stuff
     let mut count = 0;
     let mut fully_skipped = 0;
+    let mut removed_items = 0;
+    let mut total_items = 0;
     for line in reader.lines() {
         count += 1;
-        let dedup_data = process_line(&line.unwrap(), &bloom_filter, &bff_args);
+        let (dedup_data, removed_line_items, total_line_items) = process_line(&line.unwrap(), &bloom_filter, &bff_args);
+        removed_items += removed_line_items;
+        total_items += total_line_items;
+
         if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
             fully_skipped += 1;
         }
@@ -515,7 +520,7 @@ fn process_file(
         Some(pbar) => pbar.lock().unwrap().inc(1),
         None => (),
     }
-    Ok(())
+    Ok((removed_items, total_items))
 }
 
 
@@ -528,7 +533,7 @@ async fn process_file_s3(
     bloom_filter: &Arc<BloomFilter>,
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
-) -> Result<(), Error> {
+) -> Result<(usize, usize), Error> {
     //
 
     // Phase 1a: Build s3 client
@@ -565,9 +570,13 @@ async fn process_file_s3(
     // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
     let mut count = 0;
     let mut fully_skipped = 0;
+    let mut removed_items = 0;
+    let mut total_items = 0;
     while let Some(line) = lines_iter.next_line().await? {
         count += 1;
-        let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
+        let (dedup_data, removed_line_items, total_line_items) = process_line(&line.to_string(), &bloom_filter, &bff_args);
+        removed_items += removed_line_items;
+        total_items += total_line_items;
         if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
             fully_skipped += 1;
         }
@@ -600,13 +609,16 @@ async fn process_file_s3(
         None => (),
     }
     
-    Ok(())
+    Ok((removed_items, total_items))
 }
 
 
 
-fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -> serde_json::Value{
+fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -> (serde_json::Value, usize, usize){
     let mut data: Value = serde_json::from_str(&line).unwrap();
+    let mut total_items = 0;
+    let mut removed_items = 0;
+
     let text = data["text"].as_str().unwrap();
 
     let newlines = if bff_args.whole_document {
@@ -625,6 +637,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
 
     for paragraph_window in newlines.windows(2) {
         let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
+        total_items += 1;
 
         // calculate hashes for the paragraph
         let mut hashes: Vec<Vec<u64>> = Vec::new();
@@ -657,6 +670,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
             contained_ngrams as f64 / number_of_ngrams as f64 > bff_args.filtering_threshold;
         if too_many_duplicate_ngrams {
             windows_to_remove.push(paragraph_window);
+            removed_items += 1;
         } else if !bff_args.no_update_bloom_filter {
             for ngram in hashes {
                 bloom_filter.insert_hashes(&ngram);
@@ -696,7 +710,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
             map.retain(|key, _| allowed_fields.contains(&key.as_str()));
             }
     }
-    data
+    (data, removed_items, total_items)
 }
 
 
@@ -805,6 +819,7 @@ async fn main() -> std::io::Result<()> {
                      expected_ngram_count, fp_rate, human_bytes(bff_size as f64), num_hashers);
         },
     }
+
     Ok(())
 }
 
@@ -832,10 +847,11 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
             ).unwrap()
         );
     let pbar = Arc::new(Mutex::new(pbar));
+    println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
+
     if !bff_args.no_progress {
         pbar.lock().unwrap().inc(0); // initializes pbar
     }
-    println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
 
 
     // LOOP PHASE (W/ Threadpool)
@@ -845,13 +861,16 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
         bff_args.threads
     };    
     let loop_start_time = Instant::now();
+    let total_items = Arc::new(Mutex::new(0));
+    let removed_items = Arc::new(Mutex::new(0));
     let threadpool = ThreadPool::new(threads);
     for input in all_inputs {
         let mut output = output_directory.clone();
         output.push(input.file_name().unwrap());
         let bloom_filter = bloom_filter.clone();
         let bff_args = bff_args.clone();
-
+        let total_items = Arc::clone(&total_items);
+        let removed_items = Arc::clone(&removed_items);
         let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
             None
         } else {
@@ -862,7 +881,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
             if bff_args.no_progress {
                 println!("Processing {input:?}...");
             }
-            process_file(
+            let (removed_doc_items, total_doc_items) = process_file(
                 &input,
                 &output,
                 &bloom_filter,
@@ -870,6 +889,13 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
                 &pbar_option,
             )
             .unwrap();
+
+            let mut total_guard = total_items.lock().unwrap();
+            *total_guard += total_doc_items;
+
+            let mut removed_guard = removed_items.lock().unwrap();
+            *removed_guard += removed_doc_items;
+
         });
     }
     threadpool.join();    
@@ -885,6 +911,11 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
         println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
     }
     println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
+
+    let total_items = *total_items.lock().unwrap();
+    let removed_items = *removed_items.lock().unwrap();
+    println!("Stats: Saw {} items | Removed {} of them",
+             total_items, removed_items as f64 / total_items as f64);   
     Ok(())
 }
 
@@ -915,13 +946,16 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
             ).unwrap()
         );
     let pbar = Arc::new(Mutex::new(pbar));
+    println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
+
     if !bff_args.no_progress {
         pbar.lock().unwrap().inc(0); // initializes pbar
     }
-    println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
 
 
     let loop_start_time = Instant::now();
+    let total_items = Arc::new(Mutex::new(0));
+    let removed_items = Arc::new(Mutex::new(0));    
     let threads = if bff_args.threads == 0 {
         available_parallelism().unwrap().get()
     } else {
@@ -933,6 +967,8 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
         let bloom_filter = bloom_filter.clone();
         let bff_args = bff_args.clone();
         let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
+        let total_items = Arc::clone(&total_items);
+        let removed_items = Arc::clone(&removed_items);        
         let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
             None
         } else {
@@ -943,24 +979,32 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
 
 
         threadpool.execute(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    if let Err(err) = rt.block_on(
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(
                         process_file_s3(&bucket, 
                             &input_path, 
                             &output_path,
                             &bloom_filter,
                             &bff_args, 
                             &pbar_option)
-                        ) {
+                        );
+            match result {
+                Ok(outputs) => {
+                   let (rem_doc_items, tot_doc_items) = outputs;
+                   let mut total_guard = total_items.lock().unwrap();
+                   *total_guard += tot_doc_items;
+                   let mut removed_guard = removed_items.lock().unwrap();
+                   *removed_guard += rem_doc_items;
+                }
+                Err(err) => {
                         eprintln!("Error processing {}; {:?}", input_path, err);
                         let mut count = err_count.lock().unwrap();
                         *count += 1;
-                    }
-                
-                });            
+                    }                
+                }
+            });          
 
-        
-        
+            
     }
     threadpool.join();
     println!("Completed filtering all files in {:?} seconds", 
@@ -975,6 +1019,11 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     }
     println!("Error count is {}/{}", err_count.lock().unwrap(), num_files);
     println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
+
+    let total_items = *total_items.lock().unwrap();
+    let removed_items = *removed_items.lock().unwrap();
+    println!("Stats: Saw {} items | Removed {} of them",
+             total_items, removed_items as f64 / total_items as f64);    
     Ok(())
 }
 

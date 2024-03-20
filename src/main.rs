@@ -120,6 +120,14 @@ struct BffArgs{
     #[arg(long, default_value_t = false)]
     no_progress: bool,
 
+
+    /// PROFILE ARGS (REMOVE LATER)
+    #[arg(long, default_value_t = false)]
+    count_lines_only: bool,
+
+    #[arg(long, default_value_t = false)]
+    fully_download_s3: bool,
+
     #[arg(long, short = 't', default_value_t = 0)]
     threads: usize,    
 }
@@ -520,7 +528,7 @@ fn process_file(
 
 
 
-async fn process_file_s3(
+async fn process_file_s3_stream(
     s3_bucket: &String,
     s3_input: &String,
     s3_output: &String,
@@ -548,6 +556,7 @@ async fn process_file_s3(
         .send()
         .await?;
 
+
     let body_stream = object.body.into_async_read();
     let gz = asyncGZ::new(body_stream);
     let reader = tBufReader::new(gz);
@@ -556,7 +565,8 @@ async fn process_file_s3(
     // Phase 1c: Setup output buffer to upload->s3 eventually...
     // TODO: Make output writer streaming too?
     let mut output_data = Vec::new();
-    let mut writer = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
+    let encoder = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
+    let mut buf_writer = BufWriter::with_capacity(1024 * 1024, encoder);
 
 
     // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
@@ -564,13 +574,17 @@ async fn process_file_s3(
     let mut fully_skipped = 0;
     while let Some(line) = lines_iter.next_line().await? {
         count += 1;
+        if bff_args.count_lines_only { // REMOVE THIS BLOCK WHEN WE REMOVE count_lines_only arg
+            fully_skipped += 1;
+            continue;
+        }
         let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
         if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
             fully_skipped += 1;
         }
         else {
-            serde_json::to_writer(&mut writer, &dedup_data)?;
-            writer.write_all(b"\n")?;             
+            serde_json::to_writer(&mut buf_writer, &dedup_data)?;
+            buf_writer.write_all(b"\n")?;          
         }
         
     }
@@ -578,7 +592,10 @@ async fn process_file_s3(
 
 
     // Phase 3: to finalize, write to s3 if there's something to write
-    writer.finish().unwrap();
+    buf_writer.flush()?;
+    let encoder = buf_writer.into_inner().expect("Failed to get encoder");
+    encoder.finish().unwrap();
+
     if fully_skipped < count {
         let bytes_to_upload = ByteStream::from(output_data);
         client
@@ -596,6 +613,96 @@ async fn process_file_s3(
     
     Ok(())
 }
+
+
+
+async fn process_file_s3_download(
+    s3_bucket: &String,
+    s3_input: &String,
+    s3_output: &String,
+    bloom_filter: &Arc<BloomFilter>,
+    bff_args: &BffArgs,
+    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+) -> Result<(), Error> {
+    //
+
+    // Phase 1a: Build s3 client
+    let region_provider = RegionProviderChain::default_provider();
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+
+    // Phase 1b: read data into lines
+    // Note: this reads in a streaming sense (but we don't upload in streaming)
+    let object: GetObjectOutput = client
+        .get_object()
+        .bucket(s3_bucket)
+        .key(s3_input)
+        .send()
+        .await?;
+
+
+    let body_stream = object.body.into_async_read();
+    let gz = asyncGZ::new(body_stream);
+    let reader = tBufReader::new(gz);
+    let mut lines_iter = reader.lines();
+
+    // Phase 1c: Setup output buffer to upload->s3 eventually...
+    // TODO: Make output writer streaming too?
+    let mut output_data = Vec::new();
+    let encoder = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
+    let mut buf_writer = BufWriter::with_capacity(1024 * 1024, encoder);
+
+
+    // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
+    let mut count = 0;
+    let mut fully_skipped = 0;
+    while let Some(line) = lines_iter.next_line().await? {
+        count += 1;
+        if bff_args.count_lines_only { // REMOVE THIS BLOCK WHEN WE REMOVE count_lines_only arg
+            fully_skipped += 1;
+            continue;
+        }
+        let dedup_data = process_line(&line.to_string(), &bloom_filter, &bff_args);
+        if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
+            fully_skipped += 1;
+        }
+        else {
+            serde_json::to_writer(&mut buf_writer, &dedup_data)?;
+            buf_writer.write_all(b"\n")?;          
+        }
+        
+    }
+    println!("Number of lines in {:?} is {}", s3_input, count);
+
+
+    // Phase 3: to finalize, write to s3 if there's something to write
+    buf_writer.flush()?;
+    let encoder = buf_writer.into_inner().expect("Failed to get encoder");
+    encoder.finish().unwrap();
+
+    if fully_skipped < count {
+        let bytes_to_upload = ByteStream::from(output_data);
+        client
+            .put_object()
+            .bucket(s3_bucket)
+            .key(s3_output)
+            .body(bytes_to_upload)
+            .send()
+            .await?;
+    }
+    match pbar_option {
+        Some(pbar) => pbar.lock().unwrap().inc(1),
+        None => (),
+    }
+    
+    Ok(())
+}
+
+
 
 
 fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -> serde_json::Value{
@@ -793,8 +900,9 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
-            println!("To handle {} tokens with fp rate {}, you'd need a filter of size {}",
-                     expected_ngram_count, fp_rate, human_bytes(bff_size as f64));
+            let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count);
+            println!("To handle {} tokens with fp rate {}, you'd need a filter of size {} and {} hashers",
+                     expected_ngram_count, fp_rate, human_bytes(bff_size as f64), num_hashers);
         },
     }
     Ok(())
@@ -912,6 +1020,8 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     }
     println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
 
+
+    let loop_start_time = Instant::now();
     let threads = if bff_args.threads == 0 {
         available_parallelism().unwrap().get()
     } else {
@@ -931,25 +1041,49 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
         let input_path = io_pair[0].clone();
         let output_path = io_pair[1].clone();
 
-        threadpool.execute(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Err(err) = rt.block_on(
-                process_file_s3(&bucket, 
-                    &input_path, 
-                    &output_path,
-                    &bloom_filter,
-                    &bff_args, 
-                    &pbar_option)
-                ) {
-                eprintln!("Error processing {}; {:?}", input_path, err);
-                let mut count = err_count.lock().unwrap();
-                *count += 1;
-            }
-        
-        });
+
+        if bff_args.fully_download_s3 {
+            threadpool.execute(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    if let Err(err) = rt.block_on(
+                        process_file_s3_download(&bucket, 
+                            &input_path, 
+                            &output_path,
+                            &bloom_filter,
+                            &bff_args, 
+                            &pbar_option)
+                        ) {
+                        eprintln!("Error processing {}; {:?}", input_path, err);
+                        let mut count = err_count.lock().unwrap();
+                        *count += 1;
+                    }
+                
+                });
+        } else {
+            threadpool.execute(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        if let Err(err) = rt.block_on(
+                            process_file_s3_stream(&bucket, 
+                                &input_path, 
+                                &output_path,
+                                &bloom_filter,
+                                &bff_args, 
+                                &pbar_option)
+                            ) {
+                            eprintln!("Error processing {}; {:?}", input_path, err);
+                            let mut count = err_count.lock().unwrap();
+                            *count += 1;
+                        }
+                    
+                    });            
+
+        }
         
     }
     threadpool.join();
+    println!("Completed filtering all files in {:?} seconds", 
+             loop_start_time.elapsed().as_secs());
+                 
     // FINALIZE PHASE 
     if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
         let write_start_time = Instant::now();

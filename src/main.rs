@@ -120,6 +120,9 @@ struct BffArgs{
     #[arg(long, default_value_t = false)]
     no_progress: bool,
 
+    #[arg(long, short = 't', default_value_t = 0)]
+    threads: usize,    
+
 
     /// PROFILE ARGS (REMOVE LATER)
     #[arg(long, default_value_t = false)]
@@ -128,8 +131,10 @@ struct BffArgs{
     #[arg(long, default_value_t = false)]
     fully_download_s3: bool,
 
-    #[arg(long, short = 't', default_value_t = 0)]
-    threads: usize,    
+    #[arg(long, default_value_t= 0)]
+    limit_files: usize,
+
+
 }
 
 
@@ -588,7 +593,7 @@ async fn process_file_s3_stream(
         }
         
     }
-    println!("Number of lines in {:?} is {}", s3_input, count);
+    // println!("Number of lines in {:?} is {}", s3_input, count);
 
 
     // Phase 3: to finalize, write to s3 if there's something to write
@@ -1004,7 +1009,11 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
 
-    let io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
+    if bff_args.limit_files > 0 && io_pairs.len() > bff_args.limit_files {
+        io_pairs.truncate(bff_args.limit_files);
+    }
+
 
     let num_files = io_pairs.len();
     let err_count = Arc::new(Mutex::new(0));
@@ -1083,7 +1092,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     threadpool.join();
     println!("Completed filtering all files in {:?} seconds", 
              loop_start_time.elapsed().as_secs());
-                 
+
     // FINALIZE PHASE 
     if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
         let write_start_time = Instant::now();

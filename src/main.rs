@@ -170,7 +170,10 @@ enum Commands {
         output_dir: String,
 
         #[command(flatten)]
-        bff_args: BffArgs
+        bff_args: BffArgs,
+
+        #[arg(long, default_value_t=3)]
+        num_retries: usize,
     },
 
     Sysreq {
@@ -534,7 +537,7 @@ async fn process_file_s3(
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
 ) -> Result<(usize, usize), Error> {
-    //
+
 
     // Phase 1a: Build s3 client
     let region_provider = RegionProviderChain::default_provider();
@@ -758,7 +761,7 @@ fn extract_s3_basename(input_path: &str) -> &str {
 }
 
 
-async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Vec<Vec<String>>, Error> {
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Vec<(String, String)>, Error> {
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
@@ -773,7 +776,7 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Ve
         .into_paginator()
         .send();
 
-    let mut io_pairs: Vec<Vec<String>> = Vec::new();
+    let mut io_pairs: Vec<(String, String)> = Vec::new();
     while let Some(result) = response.next().await {
         match result {
             Ok(output) => {
@@ -784,7 +787,7 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str) -> Result<Ve
                     }
                     let basename = extract_s3_basename(&input_key);
                     let output_key = format!("{}{}", output_dir, basename).to_string(); 
-                    let io_pair = vec![String::from(input_key), String::from(&output_key)];
+                    let io_pair: (String, String) = (String::from(input_key), String::from(&output_key));
                     io_pairs.push(io_pair);                 
                 }
             }
@@ -809,8 +812,8 @@ async fn main() -> std::io::Result<()> {
         { 
             bff(inputs, output_directory, &bff_args)?;
         },
-        Commands::BffRemote {bucket, input_dir, output_dir, bff_args} => {
-            bff_remote(bucket, input_dir, output_dir, &bff_args).await?;
+        Commands::BffRemote {bucket, input_dir, output_dir, bff_args, num_retries} => {
+            bff_remote(bucket, input_dir, output_dir, &bff_args, num_retries).await?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
@@ -920,7 +923,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 }
 
 
-async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bff_args: &BffArgs) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bff_args: &BffArgs, num_retries: &usize) -> std::io::Result<()> {
     /*
     General pseudocode:
     Setup:
@@ -934,7 +937,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
     */
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
-    let io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir).await.unwrap();
 
 
     let num_files = io_pairs.len();
@@ -962,51 +965,64 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
         bff_args.threads
     };    
     let threadpool = ThreadPool::new(threads);
-    for io_pair in &io_pairs {
-        let bucket = bucket.clone();
-        let bloom_filter = bloom_filter.clone();
-        let bff_args = bff_args.clone();
-        let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
-        let total_items = Arc::clone(&total_items);
-        let removed_items = Arc::clone(&removed_items);        
-        let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
-            None
-        } else {
-            Some(pbar.clone())
-        };
-        let input_path = io_pair[0].clone();
-        let output_path = io_pair[1].clone();
 
+    for retry_count in 0..*num_retries {
+        let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        for io_pair in &io_pairs {
+            let num_retries = (*num_retries).clone();
+            let retry_count = retry_count.clone();
+            let bucket = bucket.clone();
+            let bloom_filter = bloom_filter.clone();
+            let bff_args = bff_args.clone();
+            let failed_io_pairs = Arc::clone(&failed_io_pairs);
+            let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
+            let total_items = Arc::clone(&total_items);
+            let removed_items = Arc::clone(&removed_items);        
+            let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
+                None
+            } else {
+                Some(pbar.clone())
+            };
 
-        threadpool.execute(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(
-                        process_file_s3(&bucket, 
-                            &input_path, 
-                            &output_path,
-                            &bloom_filter,
-                            &bff_args, 
-                            &pbar_option)
-                        );
-            match result {
-                Ok(outputs) => {
-                   let (rem_doc_items, tot_doc_items) = outputs;
-                   let mut total_guard = total_items.lock().unwrap();
-                   *total_guard += tot_doc_items;
-                   let mut removed_guard = removed_items.lock().unwrap();
-                   *removed_guard += rem_doc_items;
-                }
-                Err(err) => {
-                        eprintln!("Error processing {}; {:?}", input_path, err);
-                        let mut count = err_count.lock().unwrap();
-                        *count += 1;
-                    }                
-                }
-            });          
+            let (input_path, output_path) = io_pair.clone();
+            threadpool.execute(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(
+                            process_file_s3(&bucket, 
+                                &input_path, 
+                                &output_path,
+                                &bloom_filter,
+                                &bff_args, 
+                                &pbar_option)
+                            );
+                match result {
+                    Ok(outputs) => {
+                       let (rem_doc_items, tot_doc_items) = outputs;
+                       let mut total_guard = total_items.lock().unwrap();
+                       *total_guard += tot_doc_items;
+                       let mut removed_guard = removed_items.lock().unwrap();
+                       *removed_guard += rem_doc_items;
+                    }
+                    Err(err) => {
+                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_retries, input_path, err);
+                            if retry_count < num_retries - 1 {
+                                // in all but last round, push the failed pair to failed_io_pairs
+                                let mut fail_guard = failed_io_pairs.lock().unwrap();
+                                fail_guard.push((input_path, output_path));
+                            } else {
+                                // in last round, give up and mark this one as an error
+                                let mut count = err_count.lock().unwrap();
+                                *count += 1;                                
+                            }
 
-            
+                        }                
+                    }
+                });          
+
+            }
+        threadpool.join();
+        io_pairs = failed_io_pairs.lock().unwrap().clone();  
     }
-    threadpool.join();
     println!("Completed filtering all files in {:?} seconds", 
              loop_start_time.elapsed().as_secs());
 

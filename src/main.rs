@@ -537,8 +537,6 @@ async fn process_file_s3(
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
 ) -> Result<(usize, usize), Error> {
-
-
     // Phase 1a: Build s3 client
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
@@ -986,7 +984,10 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bf
 
             let (input_path, output_path) = io_pair.clone();
             threadpool.execute(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
                 let result = rt.block_on(
                             process_file_s3(&bucket, 
                                 &input_path, 

@@ -545,7 +545,8 @@ async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_ret
             Err(e) if attempts < num_retries => {
                 // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
                 // same time.
-                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(200));
+                println!("Error {}/{}: {}", e, attempts, num_retries);
+                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
                 let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
                 if exponential_delay > max_delay {
                     exponential_delay = max_delay;
@@ -993,6 +994,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
         bff_args.threads
     };    
     let threadpool = ThreadPool::new(threads);
+    let mut rng = rand::thread_rng();
     for io_pair in &io_pairs {
         let bucket = bucket.clone();
         let bloom_filter = bloom_filter.clone();
@@ -1037,7 +1039,9 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
                     }                
                 }
         });          
-
+        // Wait a little before spawning the next processor.
+        let random_delay = rng.gen_range(Duration::from_millis(0)..Duration::from_millis(100));
+        sleep(random_delay).await;
     }
     threadpool.join();
     println!("Completed filtering all files in {:?} seconds", 

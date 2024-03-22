@@ -542,11 +542,13 @@ async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_ret
             Err(e) if attempts < num_retries => {
                 // Calculate delay for exponential backoff
                 let delay = base_delay * 2u32.pow(attempts as u32);
-                println!("Error reading from S3, retrying in {:?}... (Attempt {}/{})", delay, attempts + 1, num_retries);
                 sleep(delay).await;
                 attempts += 1;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                println!("Too many errors reading: {}. Giving up.", key);
+                return Err(e.into()),
+            }
         }
     }
 }
@@ -560,7 +562,6 @@ async fn process_file_s3(
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
     num_retries: usize,
 ) -> Result<(usize, usize), Error> {
-    println!("Processing file s3");
     // Phase 1a: Build s3 client
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())

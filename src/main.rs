@@ -38,6 +38,7 @@ use aws_sdk_s3::operation::get_object::GetObjectOutput;
 
 use tokio::io::{AsyncBufReadExt};
 use tokio::io::BufReader as tBufReader;
+use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 
 
@@ -531,7 +532,24 @@ fn process_file(
 }
 
 
+async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
+    let mut attempts = 0;
+    let base_delay = Duration::from_millis(100); // Starting delay of 100 ms
 
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempts < num_retries => {
+                // Calculate delay for exponential backoff
+                let delay = base_delay * 2u32.pow(attempts as u32);
+                println!("Error reading from S3, retrying in {:?}... (Attempt {}/{})", delay, attempts + 1, num_retries);
+                sleep(delay).await;
+                attempts += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
 
 async fn process_file_s3(
     s3_bucket: &String,
@@ -540,7 +558,9 @@ async fn process_file_s3(
     bloom_filter: &Arc<BloomFilter>,
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+    num_retries: usize,
 ) -> Result<(usize, usize), Error> {
+    println!("Processing file s3");
     // Phase 1a: Build s3 client
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
@@ -549,17 +569,7 @@ async fn process_file_s3(
         .await;
     let client = Client::new(&config);
 
-
-    // Phase 1b: read data into lines
-    // Note: this reads in a streaming sense (but we don't upload in streaming)
-    let object: GetObjectOutput = client
-        .get_object()
-        .bucket(s3_bucket)
-        .key(s3_input)
-        .send()
-        .await?;
-
-
+    let object = get_object_with_retry(&client, s3_bucket, s3_input, num_retries).await?;
     let body_stream = object.body.into_async_read();
     let gz = asyncGZ::new(body_stream);
     let reader = tBufReader::with_capacity(1024 * 1024, gz);
@@ -974,67 +984,53 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
         bff_args.threads
     };    
     let threadpool = ThreadPool::new(threads);
+    for io_pair in &io_pairs {
+        let bucket = bucket.clone();
+        let bloom_filter = bloom_filter.clone();
+        let bff_args = bff_args.clone();
+        let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
+        let total_items = Arc::clone(&total_items);
+        let removed_items = Arc::clone(&removed_items);        
+        let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
+            None
+        } else {
+            Some(pbar.clone())
+        };
+        let num_retries = num_retries.clone();
 
-    for retry_count in 0..*num_retries {
-        let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        for io_pair in &io_pairs {
-            let num_retries = (*num_retries).clone();
-            let retry_count = retry_count.clone();
-            let bucket = bucket.clone();
-            let bloom_filter = bloom_filter.clone();
-            let bff_args = bff_args.clone();
-            let failed_io_pairs = Arc::clone(&failed_io_pairs);
-            let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
-            let total_items = Arc::clone(&total_items);
-            let removed_items = Arc::clone(&removed_items);        
-            let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
-                None
-            } else {
-                Some(pbar.clone())
-            };
+        let (input_path, output_path) = io_pair.clone();
+        threadpool.execute(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(
+                        process_file_s3(&bucket, 
+                            &input_path, 
+                            &output_path,
+                            &bloom_filter,
+                            &bff_args, 
+                            &pbar_option,
+                            num_retries)
+                        );
+            match result {
+                Ok(outputs) => {
+                    let (rem_doc_items, tot_doc_items) = outputs;
+                    let mut total_guard = total_items.lock().unwrap();
+                    *total_guard += tot_doc_items;
+                    let mut removed_guard = removed_items.lock().unwrap();
+                    *removed_guard += rem_doc_items;
+                }
+                Err(err) => {
+                        eprintln!("Error processing {}; {:?}", input_path, err);
+                        let mut count = err_count.lock().unwrap();
+                        *count += 1;                                
+                    }                
+                }
+        });          
 
-            let (input_path, output_path) = io_pair.clone();
-            threadpool.execute(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                let result = rt.block_on(
-                            process_file_s3(&bucket, 
-                                &input_path, 
-                                &output_path,
-                                &bloom_filter,
-                                &bff_args, 
-                                &pbar_option)
-                            );
-                match result {
-                    Ok(outputs) => {
-                       let (rem_doc_items, tot_doc_items) = outputs;
-                       let mut total_guard = total_items.lock().unwrap();
-                       *total_guard += tot_doc_items;
-                       let mut removed_guard = removed_items.lock().unwrap();
-                       *removed_guard += rem_doc_items;
-                    }
-                    Err(err) => {
-                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_retries, input_path, err);
-                            if retry_count < num_retries - 1 {
-                                // in all but last round, push the failed pair to failed_io_pairs
-                                let mut fail_guard = failed_io_pairs.lock().unwrap();
-                                fail_guard.push((input_path, output_path));
-                            } else {
-                                // in last round, give up and mark this one as an error
-                                let mut count = err_count.lock().unwrap();
-                                *count += 1;                                
-                            }
-
-                        }                
-                    }
-                });          
-
-            }
-        threadpool.join();
-        io_pairs = failed_io_pairs.lock().unwrap().clone();  
     }
+    threadpool.join();
     println!("Completed filtering all files in {:?} seconds", 
              loop_start_time.elapsed().as_secs());
 

@@ -547,7 +547,7 @@ async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_ret
             }
             Err(e) => {
                 println!("Too many errors reading: {}. Giving up.", key);
-                return Err(e.into()),
+                return Err(e.into());
             }
         }
     }

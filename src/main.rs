@@ -8,7 +8,7 @@ use flate2::Compression;
 use glob::glob;
 use human_bytes::human_bytes;
 use indicatif::{ProgressBar,ProgressStyle};
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
@@ -238,7 +238,7 @@ impl BloomFilter {
     }
 
     fn new(size_in_bytes: usize, num_hashers: usize) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = thread_rng();
         let mut hash_builder_seeds = Vec::with_capacity(num_hashers);
         let mut hash_builders = Vec::with_capacity(num_hashers);
         for _ in 0..num_hashers {
@@ -535,13 +535,16 @@ fn process_file(
 async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
     let mut attempts = 0;
     let base_delay = Duration::from_millis(100); // Starting delay of 100 ms
+    let mut rng = thread_rng();
 
     loop {
         match client.get_object().bucket(bucket).key(key).send().await {
             Ok(response) => return Ok(response),
             Err(e) if attempts < num_retries => {
-                // Calculate delay for exponential backoff
-                let delay = base_delay * 2u32.pow(attempts as u32);
+                // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
+                // same time.
+                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(200));
+                let delay = base_delay * 2u32.pow(attempts as u32) + random_delay;
                 sleep(delay).await;
                 attempts += 1;
             }

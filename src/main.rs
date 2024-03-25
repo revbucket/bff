@@ -34,14 +34,10 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::{Client};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
-
-
 use tokio::io::{AsyncBufReadExt};
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
-
-
 
 
 /*=======================================================
@@ -111,6 +107,9 @@ struct BffArgs{
 
     #[arg(long, default_value_t = false)]
     annotate_attribute_only: bool,            
+
+    #[arg(long, default_value_t = RemoveType::Paragraph, value_enum)]
+    remove_type: RemoveType,
 
     #[arg(long, default_value_t = false)]
     whole_document: bool,        
@@ -188,6 +187,16 @@ enum Commands {
         fp_rate: f64
     },
 
+}
+
+
+#[derive(Debug, Clone, Eq, PartialEq, clap::ValueEnum)]
+enum RemoveType {
+    // Types for what we check to see if is a duplicate
+    Paragraph, // Paragraph level only
+    Document,  // Whole document only
+    Both,      // Does paragraph first, but if enough of the ngrams are contained in the bff, removes the whole document
+               // NOTE: ^ will add some ngram data (OF TO-REMOVE ngrams) into the filter [other methods don't do this]
 }
 
 
@@ -380,6 +389,7 @@ impl BloomFilter {
 
         true
     }
+
 
     #[allow(dead_code)] // use in unit test
     fn contains(&self, s: &VecDeque<&str>) -> bool {
@@ -646,7 +656,8 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
 
     let text = data["text"].as_str().unwrap();
 
-    let newlines = if bff_args.whole_document {
+
+    let newlines = if bff_args.remove_type == RemoveType::Document {
         vec![0, text.len()]
     } else {
         let mut newlines = Vec::new();
@@ -658,6 +669,8 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
         newlines
     };
     let mut windows_to_remove = Vec::new();
+
+    let mut total_ngrams = 0;
     let mut total_contained_ngrams = 0;
 
     for paragraph_window in newlines.windows(2) {
@@ -675,6 +688,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
                 ngram.pop_front();
             }
         }
+
         // If the paragraph was too short, put in a shorter ngram, so we can dedupe short
         // paragraphs exactly.
         if hashes.is_empty() && ngram.len() >= bff_args.min_ngram_size {
@@ -685,6 +699,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
             .iter()
             .filter(|ngram| bloom_filter.contains_hashes(ngram))
             .count();
+        total_ngrams += hashes.len();
         total_contained_ngrams += contained_ngrams;
 
         // calculate how many ngrams are in the bloom filter
@@ -716,6 +731,11 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
             last_end = paragraph_window[1];
         }
         output_paragraphs.push_str(&text[last_end..]);
+        if bff_args.remove_type == RemoveType::Both &&
+          (total_contained_ngrams as f64) / (total_ngrams as f64) > bff_args.filtering_threshold
+        {
+            output_paragraphs = String::new(); // If we found enough duplicates to remove whole document too
+        }
         data["text"] = Value::String(output_paragraphs);
         data["bff_contained_ngram_count_before_dedupe"] =
             serde_json::to_value(total_contained_ngrams).unwrap();

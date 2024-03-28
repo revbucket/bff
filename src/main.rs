@@ -178,8 +178,17 @@ enum Commands {
         #[command(flatten)]
         bff_args: BffArgs,
 
+        // Local number of retries; we try to load each file from s3 this many times.
         #[arg(long, default_value_t=3)]
         num_retries: usize,
+
+        // Global number of retries; we do a full loop through all remaining files this many times.
+        // i.e., 
+        // remaining = all_paths
+        // for i in num_retries:
+        //     remaining = process_data(remaining) 
+        #[arg(long, default_value_t=3)]
+        num_global_retries: usize,
     },
 
     Sysreq {
@@ -991,7 +1000,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 
 
 
-async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize) -> std::io::Result<()> {
     /*
     General pseudocode:
     Setup:
@@ -1033,56 +1042,71 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
         bff_args.threads
     };    
     let threadpool = ThreadPool::new(threads);
-    let mut rng = rand::thread_rng();
-    for io_pair in &io_pairs {
-        let bucket = bucket.clone();
-        let bloom_filter = bloom_filter.clone();
-        let bff_args = bff_args.clone();
-        let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
-        let total_items = Arc::clone(&total_items);
-        let removed_items = Arc::clone(&removed_items);        
-        let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
-            None
-        } else {
-            Some(pbar.clone())
-        };
-        let num_retries = num_retries.clone();
 
-        let (input_path, output_path) = io_pair.clone();
-        threadpool.execute(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let result = rt.block_on(
-                        process_file_s3(&bucket, 
-                            &input_path, 
-                            &output_path,
-                            &bloom_filter,
-                            &bff_args, 
-                            &pbar_option,
-                            num_retries)
-                        );
-            match result {
-                Ok(outputs) => {
-                    let (rem_doc_items, tot_doc_items) = outputs;
-                    let mut total_guard = total_items.lock().unwrap();
-                    *total_guard += tot_doc_items;
-                    let mut removed_guard = removed_items.lock().unwrap();
-                    *removed_guard += rem_doc_items;
-                }
-                Err(err) => {
-                        eprintln!("Error processing {}; {:?}", input_path, err);
-                        let mut count = err_count.lock().unwrap();
-                        *count += 1;                                
-                    }                
-                }
-        });          
-        // Wait a little before spawning the next processor.
-        let random_delay = rng.gen_range(Duration::from_millis(0)..Duration::from_millis(100));
-        sleep(random_delay).await;
+    for retry_count in 0..*num_global_retries {
+        let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut rng = rand::thread_rng();
+        for io_pair in &io_pairs {
+            let num_global_retries = (*num_global_retries).clone();
+            let retry_count = retry_count.clone();
+            let bucket = bucket.clone();
+            let bloom_filter = bloom_filter.clone();
+            let bff_args = bff_args.clone();
+            let failed_io_pairs = Arc::clone(&failed_io_pairs);
+            let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
+            let total_items = Arc::clone(&total_items);
+            let removed_items = Arc::clone(&removed_items);        
+            let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
+                None
+            } else {
+                Some(pbar.clone())
+            };
+
+            let (input_path, output_path) = io_pair.clone();
+            threadpool.execute(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = rt.block_on(
+                            process_file_s3(&bucket, 
+                                &input_path, 
+                                &output_path,
+                                &bloom_filter,
+                                &bff_args, 
+                                &pbar_option,
+                                num_retries)
+                            );
+                match result {
+                    Ok(outputs) => {
+                        let (rem_doc_items, tot_doc_items) = outputs;
+                        let mut total_guard = total_items.lock().unwrap();
+                        *total_guard += tot_doc_items;
+                        let mut removed_guard = removed_items.lock().unwrap();
+                        *removed_guard += rem_doc_items;
+                    }
+                    Err(err) => {
+                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_global_retries, input_path, err);
+                            if retry_count < num_global_retries - 1 {
+                                // in all but last round, push the failed pair to failed_io_pairs
+                                let mut fail_guard = failed_io_pairs.lock().unwrap();
+                                fail_guard.push((input_path, output_path));
+                            } else {
+                                // in last round, give up and mark this one as an error
+                                let mut count = err_count.lock().unwrap();
+                                *count += 1;                                
+                            }
+
+                        }                
+                    }
+            });          
+            // Wait a little before spawning the next processor.
+            let random_delay = rng.gen_range(Duration::from_millis(0)..Duration::from_millis(100));
+            sleep(random_delay).await;
+        }
+        threadpool.join();
+        io_pairs = failed_io_pairs.lock().unwrap().clone();  
     }
-    threadpool.join();
     println!("Completed filtering all files in {:?} seconds", 
              loop_start_time.elapsed().as_secs());
 

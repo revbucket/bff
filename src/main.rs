@@ -886,8 +886,8 @@ async fn main() -> std::io::Result<()> {
             bff(inputs, output_directory, &bff_args)?;
         },
 
-        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries} => {
-            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries).await?;
+        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries, num_global_retries} => {
+            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries, num_global_retries).await?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);

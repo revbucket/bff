@@ -8,7 +8,8 @@ use flate2::Compression;
 use glob::glob;
 use human_bytes::human_bytes;
 use indicatif::{ProgressBar,ProgressStyle};
-use rand::Rng;
+use rand::{Rng,thread_rng};
+use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
@@ -836,6 +837,9 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
             }
         }
     }
+    let mut rng = thread_rng();
+    io_pairs.shuffle(&mut rng);
+
     Ok(io_pairs)
 }
 

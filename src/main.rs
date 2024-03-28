@@ -12,13 +12,13 @@ use rand::Rng;
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
-use std::fs::{OpenOptions, remove_file};
+use std::fs::{OpenOptions, remove_file, create_dir_all};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::io::{Cursor};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::size_of;
-use std::path::{PathBuf};
+use std::path::{PathBuf, Path};
 use std::string::String;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,7 @@ use tokio::io::{AsyncBufReadExt};
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
+use rayon::prelude::*;
 
 
 /*=======================================================
@@ -260,7 +261,7 @@ impl BloomFilter {
 
         let number_of_u32 = size_in_bytes / size_of::<AtomicU32>();
         let bits = {
-            (0..number_of_u32).map(|_| AtomicU32::default()).collect()
+            (0..number_of_u32).into_par_iter().map(|_| AtomicU32::default()).collect()
         };
 
 
@@ -520,7 +521,7 @@ fn process_file(
         removed_items += removed_line_items;
         total_items += total_line_items;
 
-        if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
+        if dedup_data.get("text").unwrap().as_str().unwrap().trim().is_empty() {
             fully_skipped += 1;
         }
         else {
@@ -796,6 +797,18 @@ fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn create_dir_if_not_exists(path: &PathBuf) -> Result<(), std::io::Error> {
+    match create_dir_all(path) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
 
 fn extract_s3_basename(input_path: &str) -> &str {
     let parts: Vec<&str> = input_path.split('/').collect();
@@ -833,7 +846,7 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
                         continue;
                     }
                     let basename = extract_s3_basename(&input_key);
-                    let output_key = format!("{}{}", output_dir, basename).to_string(); 
+                    let output_key = Path::new(output_dir).join(basename).as_os_str().to_str().unwrap().to_string();
                     let io_pair: (String, String) = (String::from(input_key), String::from(&output_key));
                     io_pairs.push(io_pair);                 
                 }
@@ -889,6 +902,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     */
     // SETUP PHASE
     let start_time = Instant::now();
+    create_dir_if_not_exists(output_directory).unwrap();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
     let all_inputs = expand_dirs(inputs).unwrap();
     let pbar = ProgressBar::new(all_inputs.len() as u64)
@@ -916,8 +930,9 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     let removed_items = Arc::new(Mutex::new(0));
     let threadpool = ThreadPool::new(threads);
     for input in all_inputs {
-        let mut output = output_directory.clone();
-        output.push(input.file_name().unwrap());
+        //let mut output = output_directory.clone();
+        let output = output_directory.clone().join(input.file_name().unwrap());
+        //output.push(input.file_name().unwrap());
         let bloom_filter = bloom_filter.clone();
         let bff_args = bff_args.clone();
         let total_items = Arc::clone(&total_items);

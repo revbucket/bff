@@ -1047,6 +1047,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
         let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut rng = rand::thread_rng();
         for io_pair in &io_pairs {
+            let num_retries = (*num_retries).clone();
             let num_global_retries = (*num_global_retries).clone();
             let retry_count = retry_count.clone();
             let bucket = bucket.clone();

@@ -125,6 +125,13 @@ struct BffArgs{
     #[arg(long, short = 't', default_value_t = 0)]
     threads: usize,    
 
+
+    #[arg(long, default_value_t=0)]
+    shard_num: usize,
+
+    #[arg(long, default_value_t=1)]
+    total_shards: usize,
+
 }
 
 
@@ -258,6 +265,17 @@ impl BloomFilter {
 
     fn size_in_bytes(&self) -> usize {
         self.bits.len() * size_of::<AtomicU32>()
+    }
+
+    fn calculate_sparsity(&self) -> f64 {
+        let set_bits:usize = self.bits.par_iter()
+            .map(|atomic| {
+                let value = atomic.load(std::sync::atomic::Ordering::Relaxed);
+                value.count_ones() as usize
+            })
+            .sum();
+        let total_bits = self.size_in_bytes() * 8;
+        return (set_bits as f64) / (total_bits as f64);
     }
 
     fn new(size_in_bytes: usize, num_hashers: usize) -> Self {
@@ -830,7 +848,8 @@ fn extract_s3_basename(input_path: &str) -> &str {
 
 
 
-async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>, offset: usize) -> Result<Vec<(String, String)>, Error> {
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>, offset: usize,
+                      shard_num: usize, total_shards: usize) -> Result<Vec<(String, String)>, Error> {
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
@@ -875,10 +894,19 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
             }
         }
     }
-    let mut rng = thread_rng();
-    io_pairs.shuffle(&mut rng);
+    // select shard before we shuffle 
+    let mut shard: Vec<(String, String)> = Vec::new();    
+    let mut idx = shard_num;
+    while idx < io_pairs.len() {
+        shard.push(io_pairs[idx].clone());
+        idx += total_shards;
+    }
 
-    Ok(io_pairs)
+    // Then shuffle
+    let mut rng = thread_rng();
+    shard.shuffle(&mut rng);
+
+    Ok(shard)
 }
 
 
@@ -927,7 +955,22 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     create_dir_if_not_exists(output_directory).unwrap();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
     let all_inputs = expand_dirs(inputs).unwrap();
-    let pbar = ProgressBar::new(all_inputs.len() as u64)
+
+    // Select shard and then shuffle
+    let mut shard: Vec<PathBuf> = Vec::new();
+    let mut idx = bff_args.shard_num;
+    while idx < all_inputs.len() {
+        shard.push(all_inputs[idx].clone());
+        idx += bff_args.total_shards;
+    }
+    // Then shuffle
+    let mut rng = thread_rng();
+    shard.shuffle(&mut rng);
+
+
+
+
+    let pbar = ProgressBar::new(shard.len() as u64)
         .with_style(
             ProgressStyle::with_template(
                 "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
@@ -951,7 +994,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     let total_items = Arc::new(Mutex::new(0));
     let removed_items = Arc::new(Mutex::new(0));
     let threadpool = ThreadPool::new(threads);
-    for input in all_inputs {
+    for input in shard {
         //let mut output = output_directory.clone();
         let output = output_directory.clone().join(input.file_name().unwrap());
         //output.push(input.file_name().unwrap());
@@ -998,6 +1041,8 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
         bloom_filter.write_to_file(&bff_args.bloom_filter_file).unwrap();
         println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
     }
+    println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
+
     println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
 
     let total_items = *total_items.lock().unwrap();
@@ -1024,7 +1069,8 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
 
-    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset, *offset).await.unwrap();
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset, *offset,
+                                    bff_args.shard_num, bff_args.total_shards).await.unwrap();
     println!("Collected {} input files...", io_pairs.len());
 
     let num_files = io_pairs.len();
@@ -1129,8 +1175,9 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
         println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
     }
     println!("Error count is {}/{}", err_count.lock().unwrap(), num_files);
-    println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
+    println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
 
+    println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
     let total_items = *total_items.lock().unwrap();
     let removed_items = *removed_items.lock().unwrap();
     println!("Stats: Saw {} items | Removed {} of them",

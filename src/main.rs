@@ -986,7 +986,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
     let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset).await.unwrap();
-
+    println!("Collected {} input files...", io_pairs.len());
 
     let num_files = io_pairs.len();
     let err_count = Arc::new(Mutex::new(0));

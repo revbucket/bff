@@ -37,6 +37,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use tokio::io::{AsyncBufReadExt};
 use tokio::io::BufReader as tBufReader;
+use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 use rayon::prelude::*;
 
@@ -174,11 +175,23 @@ enum Commands {
         #[arg(long)]
         subset: Option<usize>,
 
+        #[arg(long, default_value_t=0)]
+        offset: usize,
+
         #[command(flatten)]
         bff_args: BffArgs,
 
+        // Local number of retries; we try to load each file from s3 this many times.
         #[arg(long, default_value_t=3)]
         num_retries: usize,
+
+        // Global number of retries; we do a full loop through all remaining files this many times.
+        // i.e., 
+        // remaining = all_paths
+        // for i in num_retries:
+        //     remaining = process_data(remaining) 
+        #[arg(long, default_value_t=3)]
+        num_global_retries: usize,
     },
 
     Sysreq {
@@ -543,7 +556,35 @@ fn process_file(
 }
 
 
+async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
+    let mut attempts = 0;
+    let base_delay = Duration::from_millis(100);
+    let max_delay = Duration::from_millis(2000);
 
+    let mut rng = rand::thread_rng();
+
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempts < num_retries => {
+                // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
+                // same time.
+                println!("Error {}/{}: {}", e, attempts, num_retries);
+                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
+                let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
+                if exponential_delay > max_delay {
+                    exponential_delay = max_delay;
+                }
+                sleep(exponential_delay + random_delay).await;
+                attempts += 1;
+            }
+            Err(e) => {
+                println!("Too many errors reading: {}. Giving up.", key);
+                return Err(e.into());
+            }
+        }
+    }
+}
 
 async fn process_file_s3(
     s3_bucket: &String,
@@ -552,6 +593,7 @@ async fn process_file_s3(
     bloom_filter: &Arc<BloomFilter>,
     bff_args: &BffArgs,
     pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+    num_retries: usize,
 ) -> Result<(usize, usize), Error> {
     // Phase 1a: Build s3 client
     let region_provider = RegionProviderChain::default_provider();
@@ -561,17 +603,7 @@ async fn process_file_s3(
         .await;
     let client = Client::new(&config);
 
-
-    // Phase 1b: read data into lines
-    // Note: this reads in a streaming sense (but we don't upload in streaming)
-    let object: GetObjectOutput = client
-        .get_object()
-        .bucket(s3_bucket)
-        .key(s3_input)
-        .send()
-        .await?;
-
-
+    let object = get_object_with_retry(&client, s3_bucket, s3_input, num_retries).await?;
     let body_stream = object.body.into_async_read();
     let gz = asyncGZ::new(body_stream);
     let reader = tBufReader::with_capacity(1024 * 1024, gz);
@@ -798,7 +830,7 @@ fn extract_s3_basename(input_path: &str) -> &str {
 
 
 
-async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>) -> Result<Vec<(String, String)>, Error> {
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>, offset: usize) -> Result<Vec<(String, String)>, Error> {
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
@@ -813,11 +845,17 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
         .into_paginator()
         .send();
 
+    let mut skipped = 0;
     let mut io_pairs: Vec<(String, String)> = Vec::new();
     'outer: while let Some(result) = response.next().await {
         match result {
             Ok(output) => {
                 for object in output.contents() {
+                    if skipped < offset {
+                        // Skip files until the offset is reached
+                        skipped += 1;
+                        continue;
+                    }
                     if subset.is_some() && io_pairs.len() >= subset.unwrap() {
                         // Saw enough data for subset, skip
                         break 'outer;
@@ -857,8 +895,8 @@ async fn main() -> std::io::Result<()> {
             bff(inputs, output_directory, &bff_args)?;
         },
 
-        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries} => {
-            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries).await?;
+        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries, num_global_retries, offset} => {
+            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries, num_global_retries, offset).await?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
@@ -971,7 +1009,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 
 
 
-async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize, offset: &usize) -> std::io::Result<()> {
     /*
     General pseudocode:
     Setup:
@@ -985,7 +1023,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     */
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
-    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset).await.unwrap();
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset, *offset).await.unwrap();
 
 
     let num_files = io_pairs.len();
@@ -1014,10 +1052,12 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     };    
     let threadpool = ThreadPool::new(threads);
 
-    for retry_count in 0..*num_retries {
+    for retry_count in 0..*num_global_retries {
         let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut rng = rand::thread_rng();
         for io_pair in &io_pairs {
             let num_retries = (*num_retries).clone();
+            let num_global_retries = (*num_global_retries).clone();
             let retry_count = retry_count.clone();
             let bucket = bucket.clone();
             let bloom_filter = bloom_filter.clone();
@@ -1044,19 +1084,20 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
                                 &output_path,
                                 &bloom_filter,
                                 &bff_args, 
-                                &pbar_option)
+                                &pbar_option,
+                                num_retries)
                             );
                 match result {
                     Ok(outputs) => {
-                       let (rem_doc_items, tot_doc_items) = outputs;
-                       let mut total_guard = total_items.lock().unwrap();
-                       *total_guard += tot_doc_items;
-                       let mut removed_guard = removed_items.lock().unwrap();
-                       *removed_guard += rem_doc_items;
+                        let (rem_doc_items, tot_doc_items) = outputs;
+                        let mut total_guard = total_items.lock().unwrap();
+                        *total_guard += tot_doc_items;
+                        let mut removed_guard = removed_items.lock().unwrap();
+                        *removed_guard += rem_doc_items;
                     }
                     Err(err) => {
-                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_retries, input_path, err);
-                            if retry_count < num_retries - 1 {
+                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_global_retries, input_path, err);
+                            if retry_count < num_global_retries - 1 {
                                 // in all but last round, push the failed pair to failed_io_pairs
                                 let mut fail_guard = failed_io_pairs.lock().unwrap();
                                 fail_guard.push((input_path, output_path));
@@ -1068,9 +1109,11 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
 
                         }                
                     }
-                });          
-
-            }
+            });          
+            // Wait a little before spawning the next processor.
+            let random_delay = rng.gen_range(Duration::from_millis(0)..Duration::from_millis(100));
+            sleep(random_delay).await;
+        }
         threadpool.join();
         io_pairs = failed_io_pairs.lock().unwrap().clone();  
     }

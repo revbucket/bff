@@ -2,6 +2,7 @@ BFF
 ===
 
 The big friendly filter 😁
+(originally written by Dirk @ AI2, updated by me)
 
 Getting started
 ---------------
@@ -12,90 +13,37 @@ Getting started
 2. Run `cargo build --release`. It places the binary at `target/release/bff`.
 3. Run `./target/release/bff --help` to see the available options.
 
+
 Examples
 --------
+There are three modes `bff` (local input -> local output), `bff-remote` (S3 input -> S3 output), and `sysreq` (for assessing system requirements). We always need an input, output, false positive rate, and expected number of ngrams. But  then there's some optional hyperparameters:
 
-### Deduplicating a file against itself
+- `--min-ngram-size`: In pargraph/both mode, we ignore any paragraphs shorter than this. Defaults to 5.
+- `--max-ngram-size`: The "working width" of shinglings of ngrams: e.g., for long paragraphs/documents, we check membership over ngrams of this size. Defaults to 13.
+- `--filtering-threshold`: If at least this fraction of ngrams is present, we remove the entire paragraph/document. Defaults to 0.8
 
-This is how you deduplicate a file against itself:
-```bash
-target/release/bff \
-  --bloom-filter-file filter.bff \
-  --bloom-filter-size 274877906944 \
-  --expected-ngram-count 1000000000 \
-  --output-directory deduped/ \
-  input.json.gz
+And some REMOTE ONLY arguments:
+- `--shard-num`: For large nummbers of files, sharding is helpful. This selects some subset of the files. Defaults to 0
+- `--num-shards`: Dictates how many shards we have. Defaults to 1.
+
+### Deduplicating local files:
+For files that exist locally, say a directory `to_be_deduped/`, we can output deduplicated versions of these files in `has_been_deduped/` like:
+```cargo run --release bff \
+   --inputs to_be_deduped \
+   --output-directory has_been_deduped \
+   --expected-ngram-count 12345678 \
+   --fp-rate 0.01
 ```
 
-This creates the filter at `filter.bff`, with a size of 256 GB.
-This size should be a little smaller than the amount of main memory you have.
-It calculates the optimal setup for the filter based on the expected number of ngrams.
-Getting that number right is very important.
-If in doubt, guess high.
-It's safer to guess a higher number than a lower number.
-The filter will be created in memory, and only written to disk at the end of the job.
-
-### Deduplicating multiple files
-
-To get a lot of speed out of `bff`, you have to process multiple files at once:
-```bash
-target/release/bff \
-  --bloom-filter-file filter.bff \
-  --bloom-filter-size 274877906944 \
-  --expected-ngram-count 1000000000 \
-  --output-directory deduped/ \
-  *.json.gz # Can also pass a directory containing .json.gz files here
+### Deduplicating remote files
+For files that exist on S3, say with the prefix `s3://my-bucket/to_be_deduped/`, we can output deduplicated versions of these files in `s3://my-bucket/has_been_deduped` like:
+``` cargo run --release bff-remote \
+--bucket my-bucket \
+--input-dir to_be_deduped \
+--output_dir has_been_deduped \
+--expected-ngram-count 12345678 \\
+--fp-rate 0.01
 ```
 
-Each input file will run in its own thread, and the filter will be shared between them.
-In the end, as before the filter will be written to disk.
+There's also some options to preload or save the bloom filter itself, but you can check the code for those.
 
-### Automatically choosing filter size
-To automatically compute the size of the filter, you can instead specify a false-positive rate. `bff` will create a bloom filter to attain that false positive rate, up to 90% of the system RAM.  Note that false positive rate is per token-ngram, so the chance of a whole paragraph/document being marked as a false-positive will actually be quite less than the specified `fp-rate`:
-
-```bash
-target/release/bff \
-  --bloom-filter-file filter.bff \
-  --fp-rate 0.01 \
-  --expected-ngram-count 1000000000 \
-  --output-directory deduped/ \
-  input_dir/
-```
-
-
-### Pre-load the filter
-
-You can stick ngrams into the filter ahead of time, for example if you want to decontaminate your dataset:
-```bash
-target/release/bff \
-  --bloom-filter-file decontaminating_filter.bff \
-  --bloom-filter-size 274877906944 \
-  --expected-ngram-count 1000000000 \
-  --output-directory deduped/ \
-  --filtering-threshold 1.0 \
-  my_test_set.json.gz
-```
-
-This will copy the output unchanged to the `deduped/` directory, but it will also produce a filter that you can use afterwards.
-It is important that you still take a good guess at the ngram count you expect to see when you do the actual
-deduplication.
-The parameters of the bloom filter are baked in when you first create the file, so you have to guess right the
-first time.
-
-### Only decontaminate
-
-If you only want to decontaminate, but not deduplicate against itself, you can do that by using the filter
-you just created in the previous step:
-```bash
-target/release/bff \
-  --bloom-filter-file decontaminating_filter.bff \
-  --bloom-filter-size 274877906944 \
-  --expected-ngram-count 1000000000 \
-  --output-directory deduped/ \
-  --update-bloom-filter false \
-  *.json.gz
-```
-
-If you are using the filter this way, you can use the number of ngrams in the decontamination set for the
-`--expected-ngram-count` parameter.
-Since this is usually much smaller, it might make the filter run faster.

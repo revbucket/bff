@@ -1,23 +1,26 @@
 use ahash::RandomState;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Error};
 use byteorder::{LittleEndian, NativeEndian, ReadBytesExt, WriteBytesExt};
-use clap::Parser;
-use flate2::read::MultiGzDecoder;
+use clap::{Args, Parser, Subcommand};
+use flate2::read::{MultiGzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use glob::glob;
 use human_bytes::human_bytes;
 use indicatif::{ProgressBar,ProgressStyle};
-use rand::Rng;
+use rand::{Rng,thread_rng};
+use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::clone::Clone;
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, remove_file, create_dir_all};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
+use std::io::{Cursor};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
+use std::string::String;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant};
@@ -27,117 +30,201 @@ use sysinfo::{
 };
 use threadpool::ThreadPool;
 use unicode_segmentation::UnicodeSegmentation;
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{Client};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use tokio::io::{AsyncBufReadExt};
+use tokio::io::BufReader as tBufReader;
+use tokio::time::{Duration, sleep};
+use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
+use rayon::prelude::*;
 
 
+/*=======================================================
+=                    Argument Struct                    =
+=======================================================*/
+
+#[derive(Parser)]
+#[clap(author, version, about, long_about = None)]
+struct ArgParser {
+    #[clap(subcommand)]
+    command: Commands,
+}
 
 
-#[derive(Parser, Debug)]
-struct Args {
-    #[arg(long)]
+#[derive(Debug, Clone, Args)]
+struct BffArgs{
+    /*
+      -- BLOOM FILTER KWARGS 
+        + bloom_filter_location: where we save/load the bloom filter
+        + expected_ngram_count: how many ngrams we're expecting
+        + fp_rate: false positive (per ngram) we're expecting
+      -- BLOOM FILTER HYPERPARAMS
+        + min_ngram_size (default: 5), smallest ngram size to consider 
+        + max_ngram_size (default: 13), largest ngram size to consider 
+        + filtering_threshold (default 0.80), threshold used to determine if text is duplicate
+    
+      -- BLOOM FILTER OVERRIDE KWARGS: 
+        + bloom_filter_size (default: 0), if >0 we force the filter to have this size
+        + no_update_bloom_filter (default: false), if true, we never update the bloom filter
+        + no_save_bloom_filter (default: false), if true, we don't save the bloom filter at the end
+        + annotate_only (default: false), if true we leave text intact but annotate with which spans are duplicates
+        + whole_document (default: false), if true, we dedup across the whole document (spanning pargaraphs)
+        + whole_paragraph (default: false), if true, we don't match ngrams but rather whole paragraphs
+        + no_progress (default: false), if true, we don't display a progress bar, instead printing out files as we handle them
+        + threads: (default: 0), if > 0, we force use of this many threads, o/w it's automatically computed    
+    */
+
+    // Bloom filter kwargs
+    #[arg(required = true, long)]
     bloom_filter_file: PathBuf,
 
-    /// The size of the bloom filter in bytes. If the filter already exists, this parameter is
-    /// ignored.
-    /// If ==0 this _requires_ that fp_rate is > 0
-    #[arg(long, default_value_t=0)]
-    bloom_filter_size: usize,
+    #[arg(required = true, long)]
+    expected_ngram_count: usize,        
 
-    /// The desired per-ngram false positive rate. If bloom_filter_size is not specified, this MUST 
-    /// be specified, and the filter size will be computed using this FP rate and optimal number of 
-    /// hashers. Maxes out at 90% of system RAM
-    #[arg(long, default_value_t=0.01)]
+    #[arg(required = true, long)]
     fp_rate: f64,
 
-
-    /// The number of expected ngrams. This is used to calculate the optimal number of hashers.
-    /// If the filter already exists, this parameter is ignored.
-    #[arg(long)]
-    expected_ngram_count: usize,
-
-    /// The smallest ngram size to consider. Paragraphs that have fewer than this number of tokens
-    /// are not deduplicated and always kept. These ngrams are never added to the bloom filter.
-    /// Note that this value only matters if the paragraph has fewer tokens than the max ngram size.
+    // Bloom filter hyperparams
     #[arg(long, default_value_t = 5)]
-    min_ngram_size: usize,
+    min_ngram_size: usize,        
 
-    /// The largest ngram size to consider. Paragraphs are deduplicated based on the number of
-    /// ngrams of this size that are already present in the bloom filter.
     #[arg(long, default_value_t = 13)]
-    max_ngram_size: usize,
+    max_ngram_size: usize,        
 
-    /// If this fraction of ngrams of the max ngram size are already present in the bloom filter,
-    /// the paragraph is considered a duplicate and is discarded.
-    /// Set this to 0 to never produce any output. This is useful when you want to prime the filter
-    /// with some content that should be considered duplicates, without deduplicating that content
-    /// itself.
     #[arg(long, default_value_t = 0.80)]
     filtering_threshold: f64,
 
-    /// Whether or not to update the bloom filter. If this is true, the filter is not updated, but
-    /// the input is still deduplicated based on the filter. Default is false.
+    // Bloom filter override args
+    #[arg(long, default_value_t=0)]
+    bloom_filter_size: usize,        
+
     #[arg(long, default_value_t = false)]
-    no_update_bloom_filter: bool,
+    no_update_bloom_filter: bool,        
 
-    /// Whether or not to save the bloom filter at the end. Defaults to false (i.e., saves the bloom filter)
-    /// If this is True, the bloom filter will NOT be saved, regardless of what no_update_bloom_filter suggests
     #[arg(long, default_value_t = false)]
-    no_save_bloom_filter: bool,
+    no_save_bloom_filter: bool,        
 
-
-    /// If this is true, we keep the input intact, but we add an annotation to each document that
-    /// explains which spans from the text would have been deleted.
     #[arg(long, default_value_t = false)]
-    annotate_only: bool,
+    annotate_attribute_only: bool,            
 
-    /// If this is true, we only write out document id and source, and annotate which spans would
-    /// have been deleted. This produces an attribute file per the llm-data specification.
+    #[arg(long, default_value_t = RemoveType::Paragraph, value_enum)]
+    remove_type: RemoveType,
+
     #[arg(long, default_value_t = false)]
-    annotate_attribute_only: bool,
+    whole_document: bool,        
 
-    /// If you want ngrams to span across paragraph breaks, set this to true.
-    /// This also means that bff will only remove a complete document at a time. When this happens
-    /// the resulting document will be empty. This also means that deduplication within a document
-    /// no longer works. All in all, it might be best to only use this when you're also using
-    /// --annotate-only.
-    #[arg(long, default_value_t = false)]
-    whole_document: bool,
-
-    /// If you want to always match whole paragraphs instead of ngrams, set this to true.
-    /// Paragraphs smaller than min_ngram_size will still be excluded.
     #[arg(long, default_value_t = false)]
     whole_paragraphs: bool,
 
-    /// If you don't want to include the progress bar, set this to true.
-    /// Will print out filenames as they get processed if this is true
     #[arg(long, default_value_t = false)]
     no_progress: bool,
 
-    /// The number of threads to use for processing.
-    /// If this is 0, the number of threads is automatically determined.
     #[arg(long, short = 't', default_value_t = 0)]
-    threads: usize,
+    threads: usize,    
 
-    /// Input files. These are expected to be gzip compressed newline-delimited JSON files with a
-    /// "text" field.
-    #[arg(index = 1)]
-    inputs: Vec<PathBuf>,
 
-    /// Output directory. The output files will have the same name as the input files, but be placed
-    /// in this directory.
-    #[arg(long, short = 'o')]
-    output_directory: PathBuf,
+    #[arg(long, default_value_t=0)]
+    shard_num: usize,
+
+    #[arg(long, default_value_t=1)]
+    total_shards: usize,
+
 }
 
-fn tokenize(s: &str) -> impl Iterator<Item = &str> {
-    s.split_word_bounds().filter(|w| {
-        for c in w.chars() {
-            if !c.is_whitespace() {
-                return true;
-            }
-        }
-        false
-    })
+
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /* Two commands here: 
+      - `bff` is for LOCAL files (local in -> local out)
+      - `bff_remote` is for S3 files (S3 in -> S3 out)
+    Where each takes default arguments of: 
+
+
+    And then subcommand arguments
+    -- bff:
+        + inputs: file or files (directories okay) of gzip compressed newline-delimited JSON files with a 'text' field
+        + output_directory: where the deduplicated files get loaded to
+    
+    -- bff_remote:
+        + bucket
+        + input_dir
+        + output_dir
+        + subset
+    */
+
+    #[clap(arg_required_else_help = true)]
+    Bff {
+        // subcommand arguments
+        #[arg(required=true, long)]
+        inputs: Vec<PathBuf>,
+
+        #[arg(required=true, long)]
+        output_directory: PathBuf,    
+
+        #[command(flatten)]
+        bff_args: BffArgs, 
+    },
+
+    BffRemote {
+        #[arg(required=true, long)]
+        bucket: String,
+
+        #[arg(required=true, long)]
+        input_dir: String,
+
+        #[arg(required=true, long)]
+        output_dir: String,
+
+        #[arg(long)]
+        subset: Option<usize>,
+
+        #[arg(long, default_value_t=0)]
+        offset: usize,
+
+        #[command(flatten)]
+        bff_args: BffArgs,
+
+        // Local number of retries; we try to load each file from s3 this many times.
+        #[arg(long, default_value_t=3)]
+        num_retries: usize,
+
+        // Global number of retries; we do a full loop through all remaining files this many times.
+        // i.e., 
+        // remaining = all_paths
+        // for i in num_retries:
+        //     remaining = process_data(remaining) 
+        #[arg(long, default_value_t=3)]
+        num_global_retries: usize,
+    },
+
+    Sysreq {
+        #[arg(required=true, long)]
+        expected_ngram_count: usize,
+        #[arg(required=true, long)]
+        fp_rate: f64
+    },
+
 }
+
+
+#[derive(Debug, Clone, Eq, PartialEq, clap::ValueEnum)]
+enum RemoveType {
+    // Types for what we check to see if is a duplicate
+    Paragraph, // Paragraph level only
+    Document,  // Whole document only
+    Both,      // Does paragraph first, but if enough of the ngrams are contained in the bff, removes the whole document
+               // NOTE: ^ will add some ngram data (OF TO-REMOVE ngrams) into the filter [other methods don't do this]
+}
+
+
+
+/*===================================================
+=                     Bloom Filter stuff            =
+===================================================*/
 
 struct BloomFilter {
     bits: Vec<AtomicU32>,
@@ -167,19 +254,6 @@ impl BloomFilter {
         (1.0 - (1.0 - (1.0 / m)).powf(k * n)).powf(k)
     }
 
-    fn suggest_size_in_bytes(expected_elements: usize) -> usize {
-        let mut size_in_bytes = 1024 * 1024;
-        while size_in_bytes < usize::MAX / 2
-            && Self::prob_of_false_positive(
-                size_in_bytes,
-                expected_elements,
-                Self::optimal_number_of_hashers(size_in_bytes, expected_elements),
-            ) > 0.01
-        {
-            size_in_bytes *= 2;
-        }
-        size_in_bytes
-    }
 
     fn my_prob_of_false_positive(&self, expected_elements: usize) -> f64 {
         Self::prob_of_false_positive(
@@ -191,6 +265,17 @@ impl BloomFilter {
 
     fn size_in_bytes(&self) -> usize {
         self.bits.len() * size_of::<AtomicU32>()
+    }
+
+    fn calculate_sparsity(&self) -> f64 {
+        let set_bits:usize = self.bits.par_iter()
+            .map(|atomic| {
+                let value = atomic.load(std::sync::atomic::Ordering::Relaxed);
+                value.count_ones() as usize
+            })
+            .sum();
+        let total_bits = self.size_in_bytes() * 8;
+        return (set_bits as f64) / (total_bits as f64);
     }
 
     fn new(size_in_bytes: usize, num_hashers: usize) -> Self {
@@ -206,8 +291,8 @@ impl BloomFilter {
         }
 
         let number_of_u32 = size_in_bytes / size_of::<AtomicU32>();
-        let mut bits = {
-            (0..number_of_u32).map(|_| AtomicU32::default()).collect()
+        let bits = {
+            (0..number_of_u32).into_par_iter().map(|_| AtomicU32::default()).collect()
         };
 
 
@@ -337,16 +422,52 @@ impl BloomFilter {
         true
     }
 
+
     #[allow(dead_code)] // use in unit test
     fn contains(&self, s: &VecDeque<&str>) -> bool {
         let hashes = self.hashes(s);
         self.contains_hashes(&hashes)
     }
+
+
+    fn from_args(bff_args: &BffArgs) -> Self {
+        /* Uses a BFFArgs object to build a bloom filter 
+        Logic:
+            - Check if file exists, if so, just load it and return 
+            - Get size:
+                + if size is explicitly speciifed, use this
+                + otherwise, compute based on ngrams + fp rate 
+            - Return 
+        */        
+        let mut bloom_filter_size = bff_args.bloom_filter_size;
+
+        let bloom_filter = if bff_args.bloom_filter_file.exists() {
+            println!("Loading bloom filter from {:?}...", bff_args.bloom_filter_file);
+            BloomFilter::from_file(&bff_args.bloom_filter_file).unwrap()
+        } else {
+            println!("Creating new bloom filter...");
+            if bff_args.bloom_filter_size == 0 {
+                bloom_filter_size = compute_bloom_size(bff_args.fp_rate, bff_args.expected_ngram_count, true);
+            }
+            let num_hashers = BloomFilter::optimal_number_of_hashers(
+                bloom_filter_size,
+                bff_args.expected_ngram_count,
+            );
+            BloomFilter::new(bloom_filter_size, num_hashers)
+        };
+
+
+        println!("Bloom filter has size {} | FP Rate {:?}",
+                 human_bytes(bloom_filter.size_in_bytes() as f64), 
+                 bloom_filter.my_prob_of_false_positive(bff_args.expected_ngram_count));
+        bloom_filter
+    }
 }
 
 
 
-fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
+
+fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: bool) -> usize {
     /* Uses binary search to find optimal size of bloom filter using optimal number of hashers
        and provided ngram counts
     */
@@ -356,10 +477,16 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
 
 
     let mut lo = 1 as usize;
-    let mut hi = ((sys.total_memory() as f64) * 0.9) as usize;
+
+    let mut hi = if limit_to_sys {
+                    ((sys.total_memory() as f64) * 0.9) as usize
+                 } else {
+                    420_744_073_709_551_615 as usize
+                 };
+
 
     // Save some time by checking endpoint first
-    if BloomFilter::prob_of_false_positive(hi, expected_ngram_count, 
+    if limit_to_sys && BloomFilter::prob_of_false_positive(hi, expected_ngram_count, 
                                            BloomFilter::optimal_number_of_hashers(hi, expected_ngram_count)) > fp_rate {
         println!(
             "WARNING: To achieve desired false-positive rate, you'd need >90% of system RAM. Defaulting to 90% \
@@ -384,6 +511,305 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize) -> usize {
 }
 
 
+#[allow(clippy::too_many_arguments)]
+fn process_file(
+    input_file: &PathBuf,
+    output_file_path: &PathBuf,
+    bloom_filter: &Arc<BloomFilter>,
+    bff_args: &BffArgs,
+    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+) -> Result<(usize, usize), io::Error> {
+
+    // Setup input/output writers
+    let input_file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .create(false)
+        .open(input_file)?;
+    let reader = BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file));
+
+
+    let output_file = OpenOptions::new()
+        .read(false)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output_file_path)?;
+    let mut writer = BufWriter::with_capacity(
+        1024 * 1024,
+        GzEncoder::new(output_file, Compression::default()),
+    );
+
+
+    // Loop over lines and do BFF stuff
+    let mut count = 0;
+    let mut fully_skipped = 0;
+    let mut removed_items = 0;
+    let mut total_items = 0;
+    for line in reader.lines() {
+        count += 1;
+        let (dedup_data, removed_line_items, total_line_items) = process_line(&line.unwrap(), &bloom_filter, &bff_args);
+        removed_items += removed_line_items;
+        total_items += total_line_items;
+
+        if dedup_data.get("text").unwrap().as_str().unwrap().trim().is_empty() {
+            fully_skipped += 1;
+        }
+        else {
+            serde_json::to_writer(&mut writer, &dedup_data)?;
+            writer.write_all(b"\n")?;             
+        }        
+    }
+
+    if count == fully_skipped {
+        remove_file(output_file_path)?;
+    }
+
+
+    match pbar_option {
+        Some(pbar) => pbar.lock().unwrap().inc(1),
+        None => (),
+    }
+    Ok((removed_items, total_items))
+}
+
+
+async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
+    let mut attempts = 0;
+    let base_delay = Duration::from_millis(100);
+    let max_delay = Duration::from_millis(2000);
+
+    let mut rng = rand::thread_rng();
+
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempts < num_retries => {
+                // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
+                // same time.
+                println!("Error {}/{}: {}", e, attempts, num_retries);
+                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
+                let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
+                if exponential_delay > max_delay {
+                    exponential_delay = max_delay;
+                }
+                sleep(exponential_delay + random_delay).await;
+                attempts += 1;
+            }
+            Err(e) => {
+                println!("Too many errors reading: {}. Giving up.", key);
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+async fn process_file_s3(
+    s3_bucket: &String,
+    s3_input: &String,
+    s3_output: &String,
+    bloom_filter: &Arc<BloomFilter>,
+    bff_args: &BffArgs,
+    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+    num_retries: usize,
+) -> Result<(usize, usize), Error> {
+    // Phase 1a: Build s3 client
+    let region_provider = RegionProviderChain::default_provider();
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let object = get_object_with_retry(&client, s3_bucket, s3_input, num_retries).await?;
+    let body_stream = object.body.into_async_read();
+    let gz = asyncGZ::new(body_stream);
+    let reader = tBufReader::with_capacity(1024 * 1024, gz);
+    let mut lines_iter = reader.lines();
+
+    // Phase 1c: Setup output buffer to upload->s3 eventually...
+    // TODO: Make output writer streaming too?
+    let mut output_data = Vec::new();
+    let encoder = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
+    let mut buf_writer = BufWriter::with_capacity(1024 * 1024, encoder);
+
+
+    // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
+    let mut count = 0;
+    let mut fully_skipped = 0;
+    let mut removed_items = 0;
+    let mut total_items = 0;
+    while let Some(line) = lines_iter.next_line().await? {
+        count += 1;
+        let (dedup_data, removed_line_items, total_line_items) = process_line(&line.to_string(), &bloom_filter, &bff_args);
+        removed_items += removed_line_items;
+        total_items += total_line_items;
+        if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
+            fully_skipped += 1;
+        }
+        else {
+            serde_json::to_writer(&mut buf_writer, &dedup_data)?;
+            buf_writer.write_all(b"\n")?;          
+        }
+        
+    }
+    // println!("Number of lines in {:?} is {}", s3_input, count);
+
+
+    // Phase 3: to finalize, write to s3 if there's something to write
+    buf_writer.flush()?;
+    let encoder = buf_writer.into_inner().expect("Failed to get encoder");
+    encoder.finish().unwrap();
+
+    if fully_skipped < count {
+        let bytes_to_upload = ByteStream::from(output_data);
+        client
+            .put_object()
+            .bucket(s3_bucket)
+            .key(s3_output)
+            .body(bytes_to_upload)
+            .send()
+            .await?;
+    }
+    match pbar_option {
+        Some(pbar) => pbar.lock().unwrap().inc(1),
+        None => (),
+    }
+    
+    Ok((removed_items, total_items))
+}
+
+
+
+fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -> (serde_json::Value, usize, usize){
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let mut total_items = 0;
+    let mut removed_items = 0;
+    let text = data["text"].as_str().unwrap();
+
+
+    let newlines = if bff_args.remove_type == RemoveType::Document {
+        vec![0, text.len()]
+    } else {
+        let mut newlines = Vec::new();
+        newlines.push(0);
+        for i in text.match_indices('\n') {
+            newlines.push(i.0);
+        }
+        newlines.push(text.len());
+        newlines
+    };
+    let mut windows_to_remove = Vec::new();
+
+    let mut total_ngrams = 0;
+    let mut total_contained_ngrams = 0;
+    for paragraph_window in newlines.windows(2) {
+        let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
+        total_items += 1;
+
+        // calculate hashes for the paragraph
+        let mut hashes: Vec<Vec<u64>> = Vec::new();
+        let mut ngram: VecDeque<&str> = VecDeque::with_capacity(bff_args.max_ngram_size);
+        for token in tokenize(paragraph) {
+            ngram.push_back(token);
+            // If not hashing whole paragraphs, add ngrams to the bloom filter as they reach max size
+            if !bff_args.whole_paragraphs && ngram.len() >= bff_args.max_ngram_size {
+                hashes.push(bloom_filter.hashes(&ngram));
+                ngram.pop_front();
+            }
+        }
+
+        // If the paragraph was too short, put in a shorter ngram, so we can dedupe short
+        // paragraphs exactly.
+        if hashes.is_empty() && ngram.len() >= bff_args.min_ngram_size {
+            hashes.push(bloom_filter.hashes(&ngram));
+        }
+
+        let contained_ngrams = hashes
+            .iter()
+            .filter(|ngram| bloom_filter.contains_hashes(ngram))
+            .count();
+        total_ngrams += hashes.len();
+        total_contained_ngrams += contained_ngrams;
+
+        // calculate how many ngrams are in the bloom filter
+        let number_of_ngrams = hashes.len();
+
+        // produce output
+        let too_many_duplicate_ngrams =
+            contained_ngrams as f64 / number_of_ngrams as f64 > bff_args.filtering_threshold;
+        if too_many_duplicate_ngrams {
+            windows_to_remove.push(paragraph_window);
+            removed_items += 1;
+        } else if !bff_args.no_update_bloom_filter {
+            for ngram in hashes {
+                bloom_filter.insert_hashes(&ngram);
+            }
+        }
+    }
+
+    // if annotate_attribute_only or annotate_only, add the annotation to the json
+    if bff_args.annotate_attribute_only {
+        data["bff_duplicate_spans"] = serde_json::to_value(windows_to_remove).unwrap();
+        data["bff_contained_ngram_count"] =
+            serde_json::to_value(total_contained_ngrams).unwrap();
+    } else {
+        let mut output_paragraphs = String::new();
+        let mut last_end = 0;
+        for paragraph_window in windows_to_remove {
+            output_paragraphs.push_str(&text[last_end..paragraph_window[0]]);
+            last_end = paragraph_window[1];
+        }
+        output_paragraphs.push_str(&text[last_end..]);
+        if bff_args.remove_type == RemoveType::Both &&
+          (total_contained_ngrams as f64) / (total_ngrams as f64) > bff_args.filtering_threshold
+        {
+            output_paragraphs = String::new(); // If we found enough duplicates to remove whole document too
+        }
+        data["text"] = Value::String(output_paragraphs);
+        data["bff_contained_ngram_count_before_dedupe"] =
+            serde_json::to_value(total_contained_ngrams).unwrap();
+    }
+
+    if bff_args.annotate_attribute_only {
+        // Allowed fields
+        let allowed_fields = [
+            "bff_duplicate_spans",
+            "bff_contained_ngram_count",
+            "id",
+            "source",
+            "text"
+        ];
+
+        // Iterate through the keys of the JSON object and remove any field that is not in the allowed_fields list
+        if let Value::Object(ref mut map) = data {
+            map.retain(|key, _| allowed_fields.contains(&key.as_str()));
+            }
+    }
+    (data, removed_items, total_items)
+}
+
+
+
+
+fn tokenize(s: &str) -> impl Iterator<Item = &str> {
+    s.split_word_bounds().filter(|w| {
+        for c in w.chars() {
+            if !c.is_whitespace() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+
+
+
+/*========================================================
+=                       I/O Stuff                        =
+========================================================*/
+
 fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = vec![];
     for path in paths {
@@ -398,260 +824,364 @@ fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             files.push(path.clone());
         }
     }
-
     Ok(files)
 }
 
-
-#[allow(clippy::too_many_arguments)] // TODO : abstract parameters into a struct
-fn process_file(
-    input_file: &PathBuf,
-    output_file: &PathBuf,
-    bloom_filter: &Arc<BloomFilter>,
-    max_ngram_size: usize,
-    min_ngram_size: usize,
-    update_bloom_filter: bool,
-    filtering_threshold: f64,
-    annotate_only: bool,
-    annotate_attribute_only: bool,
-    whole_document: bool,
-    whole_paragraphs: bool,
-    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
-) -> Result<(), io::Error> {
-    let input_file = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .create(false)
-        .open(input_file)?;
-    let reader = BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file));
-
-    let output_file = OpenOptions::new()
-        .read(false)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(output_file)?;
-    let mut writer = BufWriter::with_capacity(
-        1024 * 1024,
-        GzEncoder::new(output_file, Compression::default()),
-    );
-
-    for line in reader.lines() {
-        let line = line.unwrap();
-        let mut data: Value = serde_json::from_str(&line).unwrap();
-        let text = data["text"].as_str().unwrap();
-
-        let newlines = if whole_document {
-            vec![0, text.len()]
-        } else {
-            let mut newlines = Vec::new();
-            newlines.push(0);
-            for i in text.match_indices('\n') {
-                newlines.push(i.0);
-            }
-            newlines.push(text.len());
-            newlines
-        };
-        let mut windows_to_remove = Vec::new();
-        let mut total_contained_ngrams = 0;
-
-        for paragraph_window in newlines.windows(2) {
-            let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
-
-            // calculate hashes for the paragraph
-            let mut hashes: Vec<Vec<u64>> = Vec::new();
-            let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
-            for token in tokenize(paragraph) {
-                ngram.push_back(token);
-                // If not hashing whole paragraphs, add ngrams to the bloom filter as they reach max size
-                if !whole_paragraphs && ngram.len() >= max_ngram_size {
-                    hashes.push(bloom_filter.hashes(&ngram));
-                    ngram.pop_front();
-                }
-            }
-            // If the paragraph was too short, put in a shorter ngram, so we can dedupe short
-            // paragraphs exactly.
-            if hashes.is_empty() && ngram.len() >= min_ngram_size {
-                hashes.push(bloom_filter.hashes(&ngram));
-            }
-
-            let contained_ngrams = hashes
-                .iter()
-                .filter(|ngram| bloom_filter.contains_hashes(ngram))
-                .count();
-            total_contained_ngrams += contained_ngrams;
-
-            // calculate how many ngrams are in the bloom filter
-            let number_of_ngrams = hashes.len();
-
-            // produce output
-            let too_many_duplicate_ngrams =
-                contained_ngrams as f64 / number_of_ngrams as f64 > filtering_threshold;
-            if too_many_duplicate_ngrams {
-                windows_to_remove.push(paragraph_window);
-            } else if update_bloom_filter {
-                for ngram in hashes {
-                    bloom_filter.insert_hashes(&ngram);
-                }
+fn create_dir_if_not_exists(path: &PathBuf) -> Result<(), std::io::Error> {
+    match create_dir_all(path) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(err)
             }
         }
-
-        // if annotate_attribute_only or annotate_only, add the annotation to the json
-        if annotate_attribute_only || annotate_only {
-            data["bff_duplicate_spans"] = serde_json::to_value(windows_to_remove).unwrap();
-            data["bff_contained_ngram_count"] =
-                serde_json::to_value(total_contained_ngrams).unwrap();
-        } else {
-            let mut output_paragraphs = String::new();
-            let mut last_end = 0;
-            for paragraph_window in windows_to_remove {
-                output_paragraphs.push_str(&text[last_end..paragraph_window[0]]);
-                last_end = paragraph_window[1];
-            }
-            output_paragraphs.push_str(&text[last_end..]);
-            data["text"] = Value::String(output_paragraphs);
-            data["bff_contained_ngram_count_before_dedupe"] =
-                serde_json::to_value(total_contained_ngrams).unwrap();
-        }
-
-        if annotate_attribute_only {
-            // Allowed fields
-            let allowed_fields = [
-                "bff_duplicate_spans",
-                "bff_contained_ngram_count",
-                "id",
-                "source",
-            ];
-
-            // Iterate through the keys of the JSON object and remove any field that is not in the allowed_fields list
-            if let Value::Object(ref mut map) = data {
-                map.retain(|key, _| allowed_fields.contains(&key.as_str()));
-                }
-            
-        }
-
-        serde_json::to_writer(&mut writer, &data)?;
-        writer.write_all(b"\n")?;
     }
-    match pbar_option {
-        Some(pbar) => pbar.lock().unwrap().inc(1),
-        None => (),
+}
+
+fn extract_s3_basename(input_path: &str) -> &str {
+    let parts: Vec<&str> = input_path.split('/').collect();
+    parts.last().unwrap()
+}
+
+
+
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>, offset: usize,
+                      shard_num: usize, total_shards: usize) -> Result<Vec<(String, String)>, Error> {
+    let region_provider = RegionProviderChain::default_provider();
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let mut response = client
+        .list_objects_v2()    
+        .bucket(bucket.to_owned())
+        .prefix(prefix.to_owned())
+        .into_paginator()
+        .send();
+
+    let mut skipped = 0;
+    let mut io_pairs: Vec<(String, String)> = Vec::new();
+    'outer: while let Some(result) = response.next().await {
+        match result {
+            Ok(output) => {
+                for object in output.contents() {
+                    if skipped < offset {
+                        // Skip files until the offset is reached
+                        skipped += 1;
+                        continue;
+                    }
+                    if subset.is_some() && io_pairs.len() >= subset.unwrap() {
+                        // Saw enough data for subset, skip
+                        break 'outer;
+                    }
+                    let input_key = object.key().unwrap();
+                    if !(input_key.ends_with(".jsonl.gz") || input_key.ends_with(".json.gz")) {
+                        continue;
+                    }
+                    let basename = extract_s3_basename(&input_key);
+                    let output_key = Path::new(output_dir).join(basename).as_os_str().to_str().unwrap().to_string();
+                    let io_pair: (String, String) = (String::from(input_key), String::from(&output_key));
+                    io_pairs.push(io_pair);                 
+                }
+            }
+            Err(err) => {
+                eprintln!("{err:?}")
+            }
+        }
     }
+    // select shard before we shuffle 
+    let mut shard: Vec<(String, String)> = Vec::new();    
+    let mut idx = shard_num;
+    while idx < io_pairs.len() {
+        shard.push(io_pairs[idx].clone());
+        idx += total_shards;
+    }
+
+    // Then shuffle
+    let mut rng = thread_rng();
+    shard.shuffle(&mut rng);
+
+    Ok(shard)
+}
+
+
+/*=============================================================
+=                       Main Function                         =
+=============================================================*/
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let args = ArgParser::parse();
+
+    match &args.command {
+        Commands::Bff {inputs, output_directory, bff_args} =>
+        { 
+            bff(inputs, output_directory, &bff_args)?;
+        },
+
+        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries, num_global_retries, offset} => {
+            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries, num_global_retries, offset).await?;
+        }
+        Commands::Sysreq {expected_ngram_count, fp_rate} => {
+            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
+            let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count);
+            println!("To handle {} tokens with fp rate {}, you'd need a filter of size {} and {} hashers",
+                     expected_ngram_count, fp_rate, human_bytes(bff_size as f64), num_hashers);
+        },
+    }
+
     Ok(())
 }
 
-fn main() {
-    let args = Args::parse();
-    let inputs = expand_dirs(&args.inputs).unwrap();
-    println!("Parsed {:?} input files...", inputs.len());
-    let threads = if args.threads == 0 {
-        available_parallelism().unwrap().get()
-    } else {
-        args.threads
-    };
-    let now = Instant::now();
-    let mut bloom_filter_size = args.bloom_filter_size;
-    let bloom_filter = if args.bloom_filter_file.exists() {
-        println!("Loading bloom filter from {:?}...", args.bloom_filter_file);
-        BloomFilter::from_file(&args.bloom_filter_file).unwrap()
-    } else {
-        println!("Creating new bloom filter...");
-        if args.bloom_filter_size == 0 {
-            bloom_filter_size = compute_bloom_size(args.fp_rate, args.expected_ngram_count);
-        }
-        let num_hashers = BloomFilter::optimal_number_of_hashers(
-            bloom_filter_size,
-            args.expected_ngram_count,
-        );
-        BloomFilter::new(bloom_filter_size, num_hashers)
-    };
-    let bloom_filter = Arc::new(bloom_filter);
-    println!(
-        "\t...Bloom filter loaded. ({} hashers) ({} seconds)",
-        bloom_filter.hash_builders.len(), now.elapsed().as_secs()
-    );
 
-    let p = bloom_filter.my_prob_of_false_positive(args.expected_ngram_count);
-    if p >= 0.5 {
-        println!(
-            "WARNING: Probability of a false positive after {} elements is {}.",
-            args.expected_ngram_count, p
-        );
-    } else {
-        println!(
-            "Probability of a false positive after {} elements: {}",
-            args.expected_ngram_count, p
-        );
-    }
+fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) -> std::io::Result<()> {
+    /*
+    General pseudocode:
+    Setup:
+        - Build/setup the bloom filter
+        - Expand all the inputs
+        - Setup progress bar
+    Main loop:
+        - loop over all files and process them 
+    Finalize:
+        - Write bff if needed
+    */
+    // SETUP PHASE
+    let start_time = Instant::now();
+    create_dir_if_not_exists(output_directory).unwrap();
+    let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
+    let all_inputs = expand_dirs(inputs).unwrap();
 
-    let suggested_size = BloomFilter::suggest_size_in_bytes(args.expected_ngram_count);
-    println!("Suggested size is {} | Actual size is {} ", 
-             human_bytes(suggested_size as f64), human_bytes(bloom_filter.size_in_bytes() as f64));
-    if suggested_size * 2 < bloom_filter.size_in_bytes() {
-        println!(
-            "WARNING: Your bloom filter is more than twice as large as suggested for {} elements. \
-            This is good for accuracy, but it is much slower, and likely not worth the trade-off.",
-            args.expected_ngram_count
-        );
+    // Select shard and then shuffle
+    let mut shard: Vec<PathBuf> = Vec::new();
+    let mut idx = bff_args.shard_num;
+    while idx < all_inputs.len() {
+        shard.push(all_inputs[idx].clone());
+        idx += bff_args.total_shards;
     }
-    // Build Progress bar (do some hacky arc/mutex wrapping)
-    let num_files = inputs.len() as u64;
-    let pbar = ProgressBar::new(num_files)
+    // Then shuffle
+    let mut rng = thread_rng();
+    shard.shuffle(&mut rng);
+
+
+
+
+    let pbar = ProgressBar::new(shard.len() as u64)
         .with_style(
             ProgressStyle::with_template(
                 "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
             ).unwrap()
         );
-
     let pbar = Arc::new(Mutex::new(pbar));
+    println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
 
-
-    if !args.no_progress {
+    if !bff_args.no_progress {
         pbar.lock().unwrap().inc(0); // initializes pbar
     }
 
 
-
-    let now = Instant::now();
+    // LOOP PHASE (W/ Threadpool)
+    let threads = if bff_args.threads == 0 {
+        available_parallelism().unwrap().get()
+    } else {
+        bff_args.threads
+    };    
+    let loop_start_time = Instant::now();
+    let total_items = Arc::new(Mutex::new(0));
+    let removed_items = Arc::new(Mutex::new(0));
     let threadpool = ThreadPool::new(threads);
-    for input in inputs {
-        let mut output = args.output_directory.clone();
-        output.push(input.file_name().unwrap());
+    for input in shard {
+        //let mut output = output_directory.clone();
+        let output = output_directory.clone().join(input.file_name().unwrap());
+        //output.push(input.file_name().unwrap());
         let bloom_filter = bloom_filter.clone();
-
-
-        let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if args.no_progress {
+        let bff_args = bff_args.clone();
+        let total_items = Arc::clone(&total_items);
+        let removed_items = Arc::clone(&removed_items);
+        let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
             None
         } else {
             Some(pbar.clone())
         };
 
         threadpool.execute(move || {
-            if args.no_progress {
-                println!("Procaessing {input:?}...");
+            if bff_args.no_progress {
+                println!("Processing {input:?}...");
             }
-            process_file(
+            let (removed_doc_items, total_doc_items) = process_file(
                 &input,
                 &output,
                 &bloom_filter,
-                args.max_ngram_size,
-                args.min_ngram_size,
-                !args.no_update_bloom_filter,
-                args.filtering_threshold,
-                args.annotate_only,
-                args.annotate_attribute_only,
-                args.whole_document,
-                args.whole_paragraphs,
+                &bff_args,
                 &pbar_option,
             )
             .unwrap();
+
+            let mut total_guard = total_items.lock().unwrap();
+            *total_guard += total_doc_items;
+
+            let mut removed_guard = removed_items.lock().unwrap();
+            *removed_guard += removed_doc_items;
+
         });
     }
-    threadpool.join();
-    println!("Completed deduplication in {} seconds", now.elapsed().as_secs());
-    if (!args.no_update_bloom_filter) && (!args.no_save_bloom_filter) {
-        println!("Writing bloom filter to {:?}...", args.bloom_filter_file);
-        bloom_filter.write_to_file(&args.bloom_filter_file).unwrap();
-        println!("Bloom filter written.");
+    threadpool.join();    
+    println!("Completed filtering all files in {:?} seconds", 
+             loop_start_time.elapsed().as_secs());
+    
+
+    // FINALIZE PHASE 
+    if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
+        let write_start_time = Instant::now();
+        println!("Writing bloom filter to {:?}...", bff_args.bloom_filter_file);
+        bloom_filter.write_to_file(&bff_args.bloom_filter_file).unwrap();
+        println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
     }
+    println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
+
+    println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
+
+    let total_items = *total_items.lock().unwrap();
+    let removed_items = *removed_items.lock().unwrap();
+    println!("Stats: Saw {} items | Removed {} of them",
+             total_items, removed_items as f64 / total_items as f64);   
+    Ok(())
 }
+
+
+
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize, offset: &usize) -> std::io::Result<()> {
+    /*
+    General pseudocode:
+    Setup:
+        - Build/setup the bloom filter
+        - Setup thing to read s3_io
+        - Setup progress bar
+    Main loop:
+        - loop over all files and process them 
+    Finalize:
+        - Write bff if needed
+    */
+    let start_time = Instant::now();
+    let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
+
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset, *offset,
+                                    bff_args.shard_num, bff_args.total_shards).await.unwrap();
+    println!("Collected {} input files...", io_pairs.len());
+
+    let num_files = io_pairs.len();
+    let err_count = Arc::new(Mutex::new(0));
+    let pbar = ProgressBar::new(num_files as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
+            ).unwrap()
+        );
+    let pbar = Arc::new(Mutex::new(pbar));
+    println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
+
+    if !bff_args.no_progress {
+        pbar.lock().unwrap().inc(0); // initializes pbar
+    }
+
+
+    let loop_start_time = Instant::now();
+    let total_items = Arc::new(Mutex::new(0));
+    let removed_items = Arc::new(Mutex::new(0));    
+    let threads = if bff_args.threads == 0 {
+        available_parallelism().unwrap().get()
+    } else {
+        bff_args.threads
+    };    
+    let threadpool = ThreadPool::new(threads);
+
+    for retry_count in 0..*num_global_retries {
+        let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut rng = rand::thread_rng();
+        for io_pair in &io_pairs {
+            let num_retries = (*num_retries).clone();
+            let num_global_retries = (*num_global_retries).clone();
+            let retry_count = retry_count.clone();
+            let bucket = bucket.clone();
+            let bloom_filter = bloom_filter.clone();
+            let bff_args = bff_args.clone();
+            let failed_io_pairs = Arc::clone(&failed_io_pairs);
+            let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
+            let total_items = Arc::clone(&total_items);
+            let removed_items = Arc::clone(&removed_items);        
+            let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
+                None
+            } else {
+                Some(pbar.clone())
+            };
+
+            let (input_path, output_path) = io_pair.clone();
+            threadpool.execute(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = rt.block_on(
+                            process_file_s3(&bucket, 
+                                &input_path, 
+                                &output_path,
+                                &bloom_filter,
+                                &bff_args, 
+                                &pbar_option,
+                                num_retries)
+                            );
+                match result {
+                    Ok(outputs) => {
+                        let (rem_doc_items, tot_doc_items) = outputs;
+                        let mut total_guard = total_items.lock().unwrap();
+                        *total_guard += tot_doc_items;
+                        let mut removed_guard = removed_items.lock().unwrap();
+                        *removed_guard += rem_doc_items;
+                    }
+                    Err(err) => {
+                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_global_retries, input_path, err);
+                            if retry_count < num_global_retries - 1 {
+                                // in all but last round, push the failed pair to failed_io_pairs
+                                let mut fail_guard = failed_io_pairs.lock().unwrap();
+                                fail_guard.push((input_path, output_path));
+                            } else {
+                                // in last round, give up and mark this one as an error
+                                let mut count = err_count.lock().unwrap();
+                                *count += 1;                                
+                            }
+
+                        }                
+                    }
+            });          
+            // Wait a little before spawning the next processor.
+            let random_delay = rng.gen_range(Duration::from_millis(0)..Duration::from_millis(100));
+            sleep(random_delay).await;
+        }
+        threadpool.join();
+        io_pairs = failed_io_pairs.lock().unwrap().clone();  
+    }
+    println!("Completed filtering all files in {:?} seconds", 
+             loop_start_time.elapsed().as_secs());
+
+    // FINALIZE PHASE 
+    if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
+        let write_start_time = Instant::now();
+        println!("Writing bloom filter to {:?}...", bff_args.bloom_filter_file);
+        bloom_filter.write_to_file(&bff_args.bloom_filter_file).unwrap();
+        println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
+    }
+    println!("Error count is {}/{}", err_count.lock().unwrap(), num_files);
+    println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
+
+    println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
+    let total_items = *total_items.lock().unwrap();
+    let removed_items = *removed_items.lock().unwrap();
+    println!("Stats: Saw {} items | Removed {} of them",
+             total_items, removed_items as f64 / total_items as f64);    
+    Ok(())
+}
+
+

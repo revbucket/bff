@@ -78,8 +78,8 @@ struct BffArgs{
     */
 
     // Bloom filter kwargs
-    #[arg(required = true, long)]
-    bloom_filter_file: PathBuf,
+    #[arg(long)]
+    bloom_filter_file: Option<PathBuf>,
 
     #[arg(required = true, long)]
     expected_ngram_count: usize,        
@@ -441,10 +441,12 @@ impl BloomFilter {
         */        
         let mut bloom_filter_size = bff_args.bloom_filter_size;
 
-        let bloom_filter = if bff_args.bloom_filter_file.exists() {
-            println!("Loading bloom filter from {:?}...", bff_args.bloom_filter_file);
-            BloomFilter::from_file(&bff_args.bloom_filter_file).unwrap()
-        } else {
+        let bloom_filter = match &bff_args.bloom_filter_file {
+            Some(path) if path.exists() => {
+                println!("Loading bloom filter from {:?}...", path);
+                BloomFilter::from_file(&path).unwrap()
+            }
+            _ => {
             println!("Creating new bloom filter...");
             if bff_args.bloom_filter_size == 0 {
                 bloom_filter_size = compute_bloom_size(bff_args.fp_rate, bff_args.expected_ngram_count, true);
@@ -454,8 +456,10 @@ impl BloomFilter {
                 bff_args.expected_ngram_count,
             );
             BloomFilter::new(bloom_filter_size, num_hashers)
+            }
         };
 
+ 
 
         println!("Bloom filter has size {} | FP Rate {:?}",
                  human_bytes(bloom_filter.size_in_bytes() as f64), 
@@ -1034,12 +1038,19 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     
 
     // FINALIZE PHASE 
-    if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
-        let write_start_time = Instant::now();
-        println!("Writing bloom filter to {:?}...", bff_args.bloom_filter_file);
-        bloom_filter.write_to_file(&bff_args.bloom_filter_file).unwrap();
-        println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
+    match &bff_args.bloom_filter_file {
+        Some(path) => {
+            if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
+                let write_start_time = Instant::now();
+                println!("Writing bloom filter to {:?}...", path);
+                bloom_filter.write_to_file(&path).unwrap();
+                println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
+            }
+        }
+        _ => {}
     }
+
+
     println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
 
     println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
@@ -1167,12 +1178,18 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
              loop_start_time.elapsed().as_secs());
 
     // FINALIZE PHASE 
-    if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
-        let write_start_time = Instant::now();
-        println!("Writing bloom filter to {:?}...", bff_args.bloom_filter_file);
-        bloom_filter.write_to_file(&bff_args.bloom_filter_file).unwrap();
-        println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
+    match &bff_args.bloom_filter_file {
+        Some(path) => {
+            if (!bff_args.no_update_bloom_filter) && (!bff_args.no_save_bloom_filter) {
+                let write_start_time = Instant::now();
+                println!("Writing bloom filter to {:?}...", path);
+                bloom_filter.write_to_file(&path).unwrap();
+                println!("...Bloom filter written in {:?} seconds.", write_start_time.elapsed().as_secs());
+            }
+        }
+        _ => {}
     }
+    
     println!("Error count is {}/{}", err_count.lock().unwrap(), num_files);
     println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
 

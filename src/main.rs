@@ -685,7 +685,6 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
     let mut data: Value = serde_json::from_str(&line).unwrap();
     let mut total_items = 0;
     let mut removed_items = 0;
-
     let text = data["text"].as_str().unwrap();
 
 
@@ -704,7 +703,6 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
 
     let mut total_ngrams = 0;
     let mut total_contained_ngrams = 0;
-
     for paragraph_window in newlines.windows(2) {
         let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
         total_items += 1;
@@ -780,6 +778,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
             "bff_contained_ngram_count",
             "id",
             "source",
+            "text"
         ];
 
         // Iterate through the keys of the JSON object and remove any field that is not in the allowed_fields list

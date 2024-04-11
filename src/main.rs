@@ -12,7 +12,7 @@ use rand::{Rng,thread_rng};
 use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::clone::Clone;
-use std::collections::VecDeque;
+use std::collections::{VecDeque};
 use std::fs::{OpenOptions, remove_file, create_dir_all};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
@@ -132,6 +132,9 @@ struct BffArgs{
     #[arg(long, default_value_t=1)]
     total_shards: usize,
 
+    #[arg(long, default_value_t=0)]
+    substr_seqlen: usize
+
 }
 
 
@@ -179,12 +182,6 @@ enum Commands {
         #[arg(required=true, long)]
         output_dir: String,
 
-        #[arg(long)]
-        subset: Option<usize>,
-
-        #[arg(long, default_value_t=0)]
-        offset: usize,
-
         #[command(flatten)]
         bff_args: BffArgs,
 
@@ -207,7 +204,6 @@ enum Commands {
         #[arg(required=true, long)]
         fp_rate: f64
     },
-
 }
 
 
@@ -218,6 +214,7 @@ enum RemoveType {
     Document,  // Whole document only
     Both,      // Does paragraph first, but if enough of the ngrams are contained in the bff, removes the whole document
                // NOTE: ^ will add some ngram data (OF TO-REMOVE ngrams) into the filter [other methods don't do this]
+    Substring
 }
 
 
@@ -552,7 +549,13 @@ fn process_file(
     let mut total_items = 0;
     for line in reader.lines() {
         count += 1;
-        let (dedup_data, removed_line_items, total_line_items) = process_line(&line.unwrap(), &bloom_filter, &bff_args);
+
+        let (dedup_data, removed_line_items, total_line_items) = 
+            if bff_args.remove_type == RemoveType::Substring {
+                process_line_substring(&line.unwrap(), &bloom_filter, &bff_args)
+            } else {
+                process_line(&line.unwrap(), &bloom_filter, &bff_args)
+            };
         removed_items += removed_line_items;
         total_items += total_line_items;
 
@@ -645,7 +648,14 @@ async fn process_file_s3(
     let mut total_items = 0;
     while let Some(line) = lines_iter.next_line().await? {
         count += 1;
-        let (dedup_data, removed_line_items, total_line_items) = process_line(&line.to_string(), &bloom_filter, &bff_args);
+
+        let (dedup_data, removed_line_items, total_line_items) = 
+            if bff_args.remove_type == RemoveType::Substring {
+                process_line_substring(&line.to_string(), &bloom_filter, &bff_args)
+            } else {
+                process_line(&line.to_string(), &bloom_filter, &bff_args)
+            };
+ 
         removed_items += removed_line_items;
         total_items += total_line_items;
         if dedup_data.get("text").unwrap().as_str().unwrap().is_empty() {
@@ -794,17 +804,130 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
 }
 
 
+fn process_line_substring(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -> (serde_json::Value, usize, usize){
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let text = data["text"].as_str().unwrap();
+    let mut total_tokens: i32 = 0;
+    //println!("{}", "-".repeat(100));
+    //println!("LINE IS {:?}", line);
+    //println!("Text length is {}", text.len());
+    // Step 1: Get contained ngram indices, and map from ngram/token idx -> text idx
+    let mut hashes : Vec<Vec<u64>> = Vec::new(); // Note: hashes[i] is the hash of tokens[i..i + max_ngram_size]
+    let mut ngram: VecDeque<&str> = VecDeque::with_capacity(bff_args.max_ngram_size);
+    let mut tokenidx2textidx: Vec<usize> = Vec::new();
+
+    let mut debug_tokens : Vec<&str> = Vec::new();
+    for (text_idx, token) in tokenize_indices(text) {
+        debug_tokens.push(token);
+        total_tokens += 1;
+        tokenidx2textidx.push(text_idx);
+        ngram.push_back(token);
+        if ngram.len() >= bff_args.max_ngram_size {
+            hashes.push(bloom_filter.hashes(&ngram));
+            ngram.pop_front();
+        }
+    }
+    if hashes.len() == 0 { // Too short of document, do nothing, return early
+        return (data, 0, total_tokens as usize);
+    }
+
+
+    tokenidx2textidx.push(text.len());
+    //println!("TOKENS {:?}", debug_tokens);
+    //println!("TOKENS2IDX {:?}", tokenidx2textidx);
+    let contained_ngram_idxs: Vec<i32> = hashes // idxs are TOKEN/NGRAM indices
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| bloom_filter.contains_hashes(hash))
+        .map(|(i, _)| i as i32)
+        .collect();
+    let bff_contained_ngram_count = contained_ngram_idxs.len();
+
+    //println!("CONTAINED {:?}", contained_ngram_idxs);
+    // Step 2: Collect groups of contained ngrams of length >= substr_seqlen tokens
+    // We'll keep track of spans of tokens of length at least substr_seqlen in the to_remove_token_ranges object
+    // This has [token_start, token_end] (INCLUSIVE) ranges of long-enough spans of seen tokens
+    // AND is bookended by (-1,-1), (#tokens, #tokens)
+    let remove_grouplen = (bff_args.substr_seqlen - bff_args.max_ngram_size + 1) as i32; 
+    let mut to_remove_token_ranges : Vec<(i32, i32)> = Vec::new(); // ranges of TOKEN indices to remove, i.e. [start,end] INCLUSIVE
+    let mut cur_group : (i32, i32) = (-1, -1); 
+    to_remove_token_ranges.push(cur_group); // bookend LEFT
+    for idx in &contained_ngram_idxs {
+        let idx = *idx;
+        if cur_group == (-1, -1) { // special case for first group
+            cur_group = (idx, idx);
+        } else if cur_group.1 == idx -1 { // continue growing the current group
+            cur_group = (cur_group.0, idx);
+        } else { // need to start a new group
+            //println!("STARTING NEW GROUP {:?}", cur_group);
+            if cur_group.1 - cur_group.0 >= remove_grouplen -1 { // if current group long enough, save it
+                to_remove_token_ranges.push((cur_group.0, cur_group.1 + bff_args.max_ngram_size as i32 -1 ));
+            }
+            cur_group = (idx, idx); // start a new group
+        }
+    }
+    //println!("OUTPUT CUR GROUP {:?}", cur_group);
+    if cur_group.1 - cur_group.0 >= remove_grouplen -1 { // final group (if long enough)
+        to_remove_token_ranges.push((cur_group.0, cur_group.1 + bff_args.max_ngram_size as i32 - 1));
+    }
+    to_remove_token_ranges.push((total_tokens as i32, total_tokens as i32)); // bookend RIGHT
+    let total_removed_tokens = to_remove_token_ranges.iter().map(|(s,e)| (e-s + 1)).sum::<i32>();
+    //println!("TO REMOVE RANGES {:?}", to_remove_token_ranges);
+
+
+    // Step 3: 
+    // Since we have inclusive ranges of the tokens we remove, we can get ranges of tokens we keep by .windows(2)
+    // So we create token-to-keep intervals for which pieces of text to push to output 
+    // AND ngram-to-add indices for ngrams that remain here
+    let mut output_str = String::new();
+    for window in to_remove_token_ranges.windows(2) { // windows indicate the NOT_REMOVED tokens
+
+        let tok_start = window[0].1 + 1;// also the ngram start
+        let tok_end = window[1].0;
+        let ngram_end = tok_end - bff_args.max_ngram_size as i32 + 1;
+        //println!("ADDING IN TOKENS [{:?})", (tok_start, tok_end));
+        //println!("ADDING IN NGRAMS [{:?})", (tok_start, ngram_end));
+        //println!("KEEP RANGE {:?} {:?}", tok_start, tok_end);
+        if tok_end <= tok_start {
+            continue;
+        }        
+
+        for ngram_idx in tok_start..ngram_end { // Add ngrams
+            bloom_filter.insert_hashes(&hashes[ngram_idx as usize]);
+        }
+        // And then push the text to output
+        output_str.push_str(&text[tokenidx2textidx[tok_start as usize]..tokenidx2textidx[tok_end as usize]]);
+    }
+    //println!("OUTPUT STR {:?}", output_str);
+    if bff_args.annotate_attribute_only {
+        // Spans here are like [lo,hi) ... i.e. semi-open intervals
+        let duplicate_char_spans: Vec<_> = to_remove_token_ranges.iter().map(|(s,e)| (tokenidx2textidx[*s as usize], tokenidx2textidx[*e as usize + 1])).collect();
+        data["bff_duplicate_spans"] = serde_json::to_value(duplicate_char_spans).unwrap();
+        data["bff_contained_ngram_count"] = serde_json::to_value(bff_contained_ngram_count).unwrap();
+    } else {
+        data["text"] = Value::String(output_str.trim_end().to_string());
+    }
+
+    (data, total_removed_tokens as usize, total_tokens as usize)
+}
+
+
+fn not_whitespace(w: &str) -> bool {
+    for c in w.chars() {
+        if !c.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
 
 
 fn tokenize(s: &str) -> impl Iterator<Item = &str> {
-    s.split_word_bounds().filter(|w| {
-        for c in w.chars() {
-            if !c.is_whitespace() {
-                return true;
-            }
-        }
-        false
-    })
+    s.split_word_bounds().filter(|w| {not_whitespace(w)})
+}
+
+fn tokenize_indices(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    s.split_word_bound_indices().filter(|(_, w)| {not_whitespace(w)})
 }
 
 
@@ -851,7 +974,7 @@ fn extract_s3_basename(input_path: &str) -> &str {
 
 
 
-async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>, offset: usize,
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str,
                       shard_num: usize, total_shards: usize) -> Result<Vec<(String, String)>, Error> {
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
@@ -867,21 +990,11 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
         .into_paginator()
         .send();
 
-    let mut skipped = 0;
     let mut io_pairs: Vec<(String, String)> = Vec::new();
-    'outer: while let Some(result) = response.next().await {
+    while let Some(result) = response.next().await {
         match result {
             Ok(output) => {
                 for object in output.contents() {
-                    if skipped < offset {
-                        // Skip files until the offset is reached
-                        skipped += 1;
-                        continue;
-                    }
-                    if subset.is_some() && io_pairs.len() >= subset.unwrap() {
-                        // Saw enough data for subset, skip
-                        break 'outer;
-                    }
                     let input_key = object.key().unwrap();
                     if !(input_key.ends_with(".jsonl.gz") || input_key.ends_with(".json.gz")) {
                         continue;
@@ -926,9 +1039,9 @@ async fn main() -> std::io::Result<()> {
             bff(inputs, output_directory, &bff_args)?;
         },
 
-        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries, num_global_retries, offset} => {
-            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries, num_global_retries, offset).await?;
-        }
+        Commands::BffRemote {bucket, input_dir, output_dir, bff_args, num_retries, num_global_retries} => {
+            bff_remote(bucket, input_dir, output_dir, &bff_args, num_retries, num_global_retries).await?;
+        },
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
             let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count);
@@ -1064,7 +1177,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 
 
 
-async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize, offset: &usize) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize) -> std::io::Result<()> {
     /*
     General pseudocode:
     Setup:
@@ -1079,7 +1192,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
 
-    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset, *offset,
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir,
                                     bff_args.shard_num, bff_args.total_shards).await.unwrap();
     println!("Collected {} input files...", io_pairs.len());
 
@@ -1200,5 +1313,6 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
              total_items, removed_items as f64 / total_items as f64);    
     Ok(())
 }
+
 
 

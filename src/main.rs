@@ -901,7 +901,13 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, bff_args: &
     //println!("OUTPUT STR {:?}", output_str);
     if bff_args.annotate_attribute_only {
         // Spans here are like [lo,hi) ... i.e. semi-open intervals
-        let duplicate_char_spans: Vec<_> = to_remove_token_ranges.iter().map(|(s,e)| (tokenidx2textidx[*s as usize], tokenidx2textidx[*e as usize + 1])).collect();
+        let mut duplicate_char_spans : Vec<(usize, usize)> = Vec::new();
+        for i in 1..to_remove_token_ranges.len() - 1 {
+            let (s, e) = to_remove_token_ranges[i];
+            duplicate_char_spans.push((tokenidx2textidx[s as usize], tokenidx2textidx[e as usize + 1]));
+        }
+
+
         data["bff_duplicate_spans"] = serde_json::to_value(duplicate_char_spans).unwrap();
         data["bff_contained_ngram_count"] = serde_json::to_value(bff_contained_ngram_count).unwrap();
     } else {

@@ -630,6 +630,10 @@ async fn process_file_s3(
     let gz = asyncGZ::new(body_stream);
     let reader = tBufReader::with_capacity(1024 * 1024, gz);
     let mut lines_iter = reader.lines();
+    let mut all_lines = Vec::new();
+    while let Some(line) = lines_iter.next_line().await? {
+        all_lines.push(line);
+    }
 
     // Phase 1c: Setup output buffer to upload->s3 eventually...
     // TODO: Make output writer streaming too?
@@ -643,7 +647,8 @@ async fn process_file_s3(
     let mut fully_skipped = 0;
     let mut removed_items = 0;
     let mut total_items = 0;
-    while let Some(line) = lines_iter.next_line().await? {
+    // while let Some(line) = lines_iter.next_line().await? {
+    for line in all_lines {
         count += 1;
         let (dedup_data, removed_line_items, total_line_items) = process_line(&line.to_string(), &bloom_filter, &bff_args);
         removed_items += removed_line_items;

@@ -571,12 +571,24 @@ fn process_file(
 
 
     match pbar_option {
-        Some(pbar) => pbar.lock().unwrap().inc(1),
+        Some(pbar) => {
+            let pb = pbar.lock().unwrap();
+            pb.inc(1);
+            if pb.position() < 10 || pb.position() % 100 == 0 {
+                println!("Log Progress: {}/{} - {} elapsed, ETA {}",
+                    pb.position(), pb.length().unwrap(),
+                    format_duration(pb.elapsed()),
+                    format_duration(pb.eta()));
+            }
+        }
         None => (),
     }
     Ok((removed_items, total_items))
 }
 
+fn format_duration(dur: Duration) -> String {
+    format!("{:02}:{:02}:{:02}", dur.as_secs() / 3600, (dur.as_secs() % 3600) / 60, dur.as_secs() % 60)
+}
 
 async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
     let mut attempts = 0;
@@ -681,10 +693,18 @@ async fn process_file_s3(
             .await?;
     }
     match pbar_option {
-        Some(pbar) => pbar.lock().unwrap().inc(1),
+        Some(pbar) => {
+            let pb = pbar.lock().unwrap();
+            pb.inc(1);
+            if pb.position() < 10 || pb.position() % 100 == 0 {
+                println!("Log Progress: {}/{} - {} elapsed, ETA {}",
+                    pb.position(), pb.length().unwrap(),
+                    format_duration(pb.elapsed()),
+                    format_duration(pb.eta()));
+            }
+        }
         None => (),
     }
-    
     Ok((removed_items, total_items))
 }
 

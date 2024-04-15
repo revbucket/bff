@@ -131,7 +131,6 @@ struct BffArgs{
 
     #[arg(long, default_value_t=1)]
     total_shards: usize,
-
 }
 
 
@@ -153,7 +152,6 @@ enum Commands {
         + bucket
         + input_dir
         + output_dir
-        + subset
     */
 
     #[clap(arg_required_else_help = true)]
@@ -178,12 +176,6 @@ enum Commands {
 
         #[arg(required=true, long)]
         output_dir: String,
-
-        #[arg(long)]
-        subset: Option<usize>,
-
-        #[arg(long, default_value_t=0)]
-        offset: usize,
 
         #[command(flatten)]
         bff_args: BffArgs,
@@ -659,7 +651,6 @@ async fn process_file_s3(
     let mut fully_skipped = 0;
     let mut removed_items = 0;
     let mut total_items = 0;
-    // while let Some(line) = lines_iter.next_line().await? {
     for line in all_lines {
         count += 1;
         let (dedup_data, removed_line_items, total_line_items) = process_line(&line.to_string(), &bloom_filter, &bff_args);
@@ -876,7 +867,7 @@ fn extract_s3_basename(input_path: &str) -> &str {
 
 
 
-async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Option<usize>, offset: usize,
+async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str,
                       shard_num: usize, total_shards: usize) -> Result<Vec<(String, String)>, Error> {
     let region_provider = RegionProviderChain::default_provider();
     let config = aws_config::defaults(BehaviorVersion::latest())
@@ -892,21 +883,11 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
         .into_paginator()
         .send();
 
-    let mut skipped = 0;
     let mut io_pairs: Vec<(String, String)> = Vec::new();
-    'outer: while let Some(result) = response.next().await {
+    while let Some(result) = response.next().await {
         match result {
             Ok(output) => {
                 for object in output.contents() {
-                    if skipped < offset {
-                        // Skip files until the offset is reached
-                        skipped += 1;
-                        continue;
-                    }
-                    if subset.is_some() && io_pairs.len() >= subset.unwrap() {
-                        // Saw enough data for subset, skip
-                        break 'outer;
-                    }
                     let input_key = object.key().unwrap();
                     if !(input_key.ends_with(".jsonl.gz") || input_key.ends_with(".json.gz")) {
                         continue;
@@ -948,11 +929,13 @@ async fn main() -> std::io::Result<()> {
     match &args.command {
         Commands::Bff {inputs, output_directory, bff_args} =>
         { 
+            assert!(bff_args.shard_num < bff_args.total_shards, "Shard num must be <= total shards");
             bff(inputs, output_directory, &bff_args)?;
         },
 
-        Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries, num_global_retries, offset} => {
-            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries, num_global_retries, offset).await?;
+        Commands::BffRemote {bucket, input_dir, output_dir, bff_args, num_retries, num_global_retries} => {
+            assert!(bff_args.shard_num < bff_args.total_shards, "Shard num must be <= total shards");
+            bff_remote(bucket, input_dir, output_dir, &bff_args, num_retries, num_global_retries).await?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
@@ -1089,7 +1072,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 
 
 
-async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize, offset: &usize) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize) -> std::io::Result<()> {
     /*
     General pseudocode:
     Setup:
@@ -1104,7 +1087,7 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     let start_time = Instant::now();
     let bloom_filter = Arc::new(BloomFilter::from_args(bff_args));
 
-    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir, subset, *offset,
+    let mut io_pairs = gather_s3_io(bucket, input_dir, output_dir,
                                     bff_args.shard_num, bff_args.total_shards).await.unwrap();
     println!("Collected {} input files...", io_pairs.len());
 

@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --min-ngram-size=*) # default 20
-      s3_output="${1#*=}"
+      min_ngram_size="${1#*=}"
       shift
       ;;
     --max-ngramsize=*) # default 20

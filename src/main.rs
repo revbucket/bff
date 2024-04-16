@@ -8,7 +8,7 @@ use flate2::Compression;
 use glob::glob;
 use human_bytes::human_bytes;
 use indicatif::{ProgressBar,ProgressStyle};
-use rand::{Rng,thread_rng};
+use rand::{Rng,thread_rng, SeedableRng};
 use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::clone::Clone;
@@ -41,6 +41,7 @@ use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 use rayon::prelude::*;
 
+use tokio::sync::Mutex as tMutex;
 
 /*=======================================================
 =                    Argument Struct                    =
@@ -136,7 +137,7 @@ struct BffArgs{
 
 
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /* Two commands here: 
       - `bff` is for LOCAL files (local in -> local out)
@@ -246,7 +247,7 @@ impl BloomFilter {
     fn prob_of_false_positive(
         size_in_bytes: usize,
         expected_elements: usize,
-        num_hashers: usize,
+        num_hashers: usize
     ) -> f64 {
         let k = num_hashers as f64;
         let m = (size_in_bytes * 8) as f64;
@@ -279,7 +280,8 @@ impl BloomFilter {
     }
 
     fn new(size_in_bytes: usize, num_hashers: usize) -> Self {
-        let mut rng = rand::thread_rng();
+        //let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::StdRng::from_entropy();
         let mut hash_builder_seeds = Vec::with_capacity(num_hashers);
         let mut hash_builders = Vec::with_capacity(num_hashers);
         for _ in 0..num_hashers {
@@ -582,8 +584,9 @@ async fn get_object_with_retry(client: &Client, bucket: &str, key: &str, num_ret
     let mut attempts = 0;
     let base_delay = Duration::from_millis(100);
     let max_delay = Duration::from_millis(2000);
+    let mut rng = rand::rngs::StdRng::from_entropy();
 
-    let mut rng = rand::thread_rng();
+    //let mut rng = rand::thread_rng();
 
     loop {
         match client.get_object().bucket(bucket).key(key).send().await {
@@ -614,7 +617,7 @@ async fn process_file_s3(
     s3_output: &String,
     bloom_filter: &Arc<BloomFilter>,
     bff_args: &BffArgs,
-    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+    pbar_option: &Option<Arc<tMutex<ProgressBar>>>,
     num_retries: usize,
 ) -> Result<(usize, usize), Error> {
     // Phase 1a: Build s3 client
@@ -654,8 +657,7 @@ async fn process_file_s3(
         else {
             serde_json::to_writer(&mut buf_writer, &dedup_data)?;
             buf_writer.write_all(b"\n")?;          
-        }
-        
+        }        
     }
     // println!("Number of lines in {:?} is {}", s3_input, count);
 
@@ -665,7 +667,7 @@ async fn process_file_s3(
     let encoder = buf_writer.into_inner().expect("Failed to get encoder");
     encoder.finish().unwrap();
 
-    if fully_skipped < count {
+    if fully_skipped < count && false {
         let bytes_to_upload = ByteStream::from(output_data);
         client
             .put_object()
@@ -676,7 +678,7 @@ async fn process_file_s3(
             .await?;
     }
     match pbar_option {
-        Some(pbar) => pbar.lock().unwrap().inc(1),
+        Some(pbar) => pbar.lock().await.inc(1),
         None => (),
     }
     
@@ -916,22 +918,36 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
 /*=============================================================
 =                       Main Function                         =
 =============================================================*/
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+//#[tokio::main]
+fn main() -> Result<()> {
     let args = ArgParser::parse();
+    let command = args.command.clone();
 
-    match &args.command {
+    match command {
         Commands::Bff {inputs, output_directory, bff_args} =>
         { 
-            bff(inputs, output_directory, &bff_args)?;
+            bff(&inputs, &output_directory, &bff_args)?;
         },
 
         Commands::BffRemote {bucket, input_dir, output_dir, subset, bff_args, num_retries, num_global_retries, offset} => {
-            bff_remote(bucket, input_dir, output_dir, subset, &bff_args, num_retries, num_global_retries, offset).await?;
+            let threads = if bff_args.threads == 0 {
+                available_parallelism().unwrap().get()
+            } else {
+                bff_args.threads
+            };    
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_time()
+                .enable_io()
+                .build()
+                .unwrap();            
+            rt.block_on(async move {
+            bff_remote(&bucket, &input_dir, &output_dir, &subset, &bff_args, &num_retries, &num_global_retries, &offset).await
+            })?;
         }
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
-            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
-            let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count);
+            let bff_size = compute_bloom_size(fp_rate, expected_ngram_count, false);
+            let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, expected_ngram_count);
             println!("To handle {} tokens with fp rate {}, you'd need a filter of size {} and {} hashers",
                      expected_ngram_count, fp_rate, human_bytes(bff_size as f64), num_hashers);
         },
@@ -1064,7 +1080,7 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
 
 
 
-async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize, offset: &usize) -> std::io::Result<()> {
+async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, subset: &Option<usize>, bff_args: &BffArgs, num_retries: &usize, num_global_retries: &usize, offset: &usize) -> Result<()> {
     /*
     General pseudocode:
     Setup:
@@ -1084,34 +1100,33 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
     println!("Collected {} input files...", io_pairs.len());
 
     let num_files = io_pairs.len();
-    let err_count = Arc::new(Mutex::new(0));
+
+    let err_count = Arc::new(tMutex::new(0));
     let pbar = ProgressBar::new(num_files as u64)
         .with_style(
             ProgressStyle::with_template(
                 "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
             ).unwrap()
         );
-    let pbar = Arc::new(Mutex::new(pbar));
+    let pbar = Arc::new(tMutex::new(pbar));
     println!("Completed setup phase in {:?} seconds", start_time.elapsed().as_secs());
 
     if !bff_args.no_progress {
-        pbar.lock().unwrap().inc(0); // initializes pbar
+        pbar.lock().await.inc(0); // initializes pbar
     }
 
 
     let loop_start_time = Instant::now();
-    let total_items = Arc::new(Mutex::new(0));
-    let removed_items = Arc::new(Mutex::new(0));    
-    let threads = if bff_args.threads == 0 {
-        available_parallelism().unwrap().get()
-    } else {
-        bff_args.threads
-    };    
-    let threadpool = ThreadPool::new(threads);
+    let total_items = Arc::new(tMutex::new(0));
+    let removed_items = Arc::new(tMutex::new(0));    
+    //let threadpool = ThreadPool::new(threads);
+
 
     for retry_count in 0..*num_global_retries {
-        let failed_io_pairs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut rng = rand::thread_rng();
+        let failed_io_pairs: Arc<tMutex<Vec<(String, String)>>> = Arc::new(tMutex::new(Vec::new()));
+        // This tokio runtime works
+
+        let mut tasks = Vec::new();
         for io_pair in &io_pairs {
             let num_retries = (*num_retries).clone();
             let num_global_retries = (*num_global_retries).clone();
@@ -1120,60 +1135,64 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
             let bloom_filter = bloom_filter.clone();
             let bff_args = bff_args.clone();
             let failed_io_pairs = Arc::clone(&failed_io_pairs);
-            let err_count: Arc<Mutex<i32>> = Arc::clone(&err_count);
+
+            let err_count: Arc<tMutex<i32>> = Arc::clone(&err_count);
             let total_items = Arc::clone(&total_items);
             let removed_items = Arc::clone(&removed_items);        
-            let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
+            let pbar_option: Option<Arc<tMutex<ProgressBar>>> = if bff_args.no_progress {
                 None
             } else {
                 Some(pbar.clone())
             };
 
             let (input_path, output_path) = io_pair.clone();
-            threadpool.execute(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                let result = rt.block_on(
+
+            let task = tokio::task::spawn(async move {
+                let result =
                             process_file_s3(&bucket, 
                                 &input_path, 
                                 &output_path,
                                 &bloom_filter,
                                 &bff_args, 
                                 &pbar_option,
-                                num_retries)
-                            );
+                                num_retries).await;
+                                          
                 match result {
                     Ok(outputs) => {
                         let (rem_doc_items, tot_doc_items) = outputs;
-                        let mut total_guard = total_items.lock().unwrap();
+                        let mut total_guard = total_items.lock().await;
                         *total_guard += tot_doc_items;
-                        let mut removed_guard = removed_items.lock().unwrap();
+                        let mut removed_guard = removed_items.lock().await;
                         *removed_guard += rem_doc_items;
                     }
                     Err(err) => {
-                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_global_retries, input_path, err);
+                            eprintln!("Round {}/{}: Error processing {}; {:?}", retry_count+1, num_global_retries, input_path, err.source());
+
                             if retry_count < num_global_retries - 1 {
                                 // in all but last round, push the failed pair to failed_io_pairs
-                                let mut fail_guard = failed_io_pairs.lock().unwrap();
+                                let mut fail_guard = failed_io_pairs.lock().await;
                                 fail_guard.push((input_path, output_path));
                             } else {
                                 // in last round, give up and mark this one as an error
-                                let mut count = err_count.lock().unwrap();
+                                let mut count = err_count.lock().await;
                                 *count += 1;                                
                             }
 
                         }                
                     }
             });          
-            // Wait a little before spawning the next processor.
+
+            tasks.push(task);
+            let mut rng = rand::thread_rng();
+
             let random_delay = rng.gen_range(Duration::from_millis(0)..Duration::from_millis(100));
             sleep(random_delay).await;
         }
-        threadpool.join();
-        io_pairs = failed_io_pairs.lock().unwrap().clone();  
+   
+        futures::future::join_all(tasks).await;
+        io_pairs = failed_io_pairs.lock().await.clone();
     }
+    //return Ok(());
     println!("Completed filtering all files in {:?} seconds", 
              loop_start_time.elapsed().as_secs());
 
@@ -1190,15 +1209,14 @@ async fn bff_remote(bucket: &String, input_dir: &String, output_dir: &String, su
         _ => {}
     }
     
-    println!("Error count is {}/{}", err_count.lock().unwrap(), num_files);
+    println!("Error count is {}/{}", err_count.lock().await, num_files);
     println!("After running, BFF sparsity was {:?}", bloom_filter.calculate_sparsity());
 
     println!("Completed full BFF run in {:?} seconds", start_time.elapsed().as_secs());
-    let total_items = *total_items.lock().unwrap();
-    let removed_items = *removed_items.lock().unwrap();
+    let total_items = *total_items.lock().await;
+    let removed_items = *removed_items.lock().await;
     println!("Stats: Saw {} items | Removed {} of them",
              total_items, removed_items as f64 / total_items as f64);    
     Ok(())
 }
-
 

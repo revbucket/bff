@@ -534,7 +534,6 @@ async fn process_file(
     encoder.finish().unwrap();
     if fully_skipped < count {
         if is_s3(output_file) {
-            println!("Starting upload to {:?}", output_file);
             let (output_bucket, output_key) = split_s3_path(output_file);
             let client = get_s3_client().await;
             let _ = client
@@ -544,7 +543,6 @@ async fn process_file(
                 .body(ByteStream::from(output_data))
                 .send()
                 .await;            
-            println!("Finished upload");
         } else {
             let mut output_file = OpenOptions::new()
                 .read(false)

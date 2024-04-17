@@ -95,6 +95,10 @@ enum Commands {
         #[arg(long, default_value_t = 0.80)]
         filtering_threshold: f64,
 
+        /// How many tokens to count as a duplicate in substring mode
+        #[arg(long, default_value_t = 50)]
+        substr_seqlen: usize,
+
         /// Which "BFF mode" we're in. We have options of 'paragraph', 'document', 'both'
         /// indicating we remove individual paragraphs/documents if duplicated
         /// The logic for "both" mode is a bit subtle. See comments below
@@ -133,6 +137,8 @@ enum Commands {
 
         #[arg(long, default_value_t=1)]
         total_shards: usize,   
+
+
     },
 
     Sysreq {
@@ -158,19 +164,31 @@ enum RemoveType {
 
     /// Does paragraph removal, BUT if enough of the paragraph ngram checks are contained, removes the whole document
     Both,     
+
+    /// Does substring style removal
+    Substring,
+
+}
+
+
+fn not_whitespace(w: &str) -> bool {
+    for c in w.chars() {
+        if !c.is_whitespace() {
+            return true;
+        }
+    }
+    false
 }
 
 
 fn tokenize(s: &str) -> impl Iterator<Item = &str> {
-    s.split_word_bounds().filter(|w| {
-        for c in w.chars() {
-            if !c.is_whitespace() {
-                return true;
-            }
-        }
-        false
-    })
+    s.split_word_bounds().filter(|w| {not_whitespace(w)})
 }
+
+fn tokenize_indices(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    s.split_word_bound_indices().filter(|(_, w)| {not_whitespace(w)})
+}
+
 
 
 /*=============================================================
@@ -471,6 +489,7 @@ async fn process_file(
     bloom_filter: &Arc<BloomFilter>,
     max_ngram_size: usize,
     min_ngram_size: usize,
+    substr_seqlen: usize,
     remove_type: &RemoveType,
     filtering_threshold: f64,
     no_update_bloom_filter: bool,    
@@ -513,10 +532,15 @@ async fn process_file(
     let mut total_text_bytes = 0;
     for line in lines {
         count += 1;
-        let (dedup_data, removed_line_bytes, total_line_bytes) = process_line(&line.unwrap(), &bloom_filter,
-                                                                           min_ngram_size, max_ngram_size,
-                                                                           remove_type, filtering_threshold,
-                                                                           no_update_bloom_filter, annotate);
+
+
+        let (dedup_data, removed_line_bytes, total_line_bytes) = if *remove_type != RemoveType::Substring {
+            process_line(&line.unwrap(), &bloom_filter, min_ngram_size, max_ngram_size,
+                         remove_type, filtering_threshold, no_update_bloom_filter, annotate)
+        } else {
+            process_line_substring(&line.unwrap(), &bloom_filter, max_ngram_size,
+                                   no_update_bloom_filter, annotate, substr_seqlen)
+        };
         removed_text_bytes += removed_line_bytes;
         total_text_bytes += total_line_bytes;
         if dedup_data.get("text").unwrap().as_str().unwrap().trim().is_empty() {
@@ -674,6 +698,126 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
 
     (data, removed_bytes, total_bytes)
 }
+
+
+fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_size: usize,
+                           no_update_bloom_filter: bool, annotate: bool, substr_seqlen: usize) -> 
+    (serde_json::Value, usize, usize) {
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let text = data["text"].as_str().unwrap();
+    let mut total_tokens: i32 = 0;
+
+    let total_bytes = text.len();
+    //println!("{}", "-".repeat(100));
+    //println!("LINE IS {:?}", line);
+    //println!("Text length is {}", text.len());
+    // Step 1: Get contained ngram indices, and map from ngram/token idx -> text idx
+    let mut hashes : Vec<Vec<u64>> = Vec::new(); // Note: hashes[i] is the hash of tokens[i..i + max_ngram_size]
+    let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
+    let mut tokenidx2textidx: Vec<usize> = Vec::new();
+
+    let mut debug_tokens : Vec<&str> = Vec::new();
+    for (text_idx, token) in tokenize_indices(text) {
+        debug_tokens.push(token);
+        total_tokens += 1;
+        tokenidx2textidx.push(text_idx);
+        ngram.push_back(token);
+        if ngram.len() >= max_ngram_size {
+            hashes.push(bloom_filter.hashes(&ngram));
+            ngram.pop_front();
+        }
+    }
+    if hashes.len() == 0 { // Too short of document, do nothing, return early
+        return (data, 0, total_tokens as usize);
+    }
+
+
+    tokenidx2textidx.push(text.len());
+    //println!("TOKENS {:?}", debug_tokens);
+    //println!("TOKENS2IDX {:?}", tokenidx2textidx);
+    let contained_ngram_idxs: Vec<i32> = hashes // idxs are TOKEN/NGRAM indices
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| bloom_filter.contains_hashes(hash))
+        .map(|(i, _)| i as i32)
+        .collect();
+    let bff_contained_ngram_count = contained_ngram_idxs.len();
+
+    //println!("CONTAINED {:?}", contained_ngram_idxs);
+    // Step 2: Collect groups of contained ngrams of length >= substr_seqlen tokens
+    // We'll keep track of spans of tokens of length at least substr_seqlen in the to_remove_token_ranges object
+    // This has [token_start, token_end] (INCLUSIVE) ranges of long-enough spans of seen tokens
+    // AND is bookended by (-1,-1), (#tokens, #tokens)
+    let remove_grouplen = (substr_seqlen - max_ngram_size + 1) as i32; 
+    let mut to_remove_token_ranges : Vec<(i32, i32)> = Vec::new(); // ranges of TOKEN indices to remove, i.e. [start,end] INCLUSIVE
+    let mut cur_group : (i32, i32) = (-1, -1); 
+    to_remove_token_ranges.push(cur_group); // bookend LEFT
+    for idx in &contained_ngram_idxs {
+        let idx = *idx;
+        if cur_group == (-1, -1) { // special case for first group
+            cur_group = (idx, idx);
+        } else if cur_group.1 == idx -1 { // continue growing the current group
+            cur_group = (cur_group.0, idx);
+        } else { // need to start a new group
+            //println!("STARTING NEW GROUP {:?}", cur_group);
+            if cur_group.1 - cur_group.0 >= remove_grouplen -1 { // if current group long enough, save it
+                to_remove_token_ranges.push((cur_group.0, cur_group.1 + max_ngram_size as i32 -1 ));
+            }
+            cur_group = (idx, idx); // start a new group
+        }
+    }
+    //println!("OUTPUT CUR GROUP {:?}", cur_group);
+    if cur_group.1 - cur_group.0 >= remove_grouplen -1 { // final group (if long enough)
+        to_remove_token_ranges.push((cur_group.0, cur_group.1 + max_ngram_size as i32 - 1));
+    }
+    to_remove_token_ranges.push((total_tokens as i32, total_tokens as i32)); // bookend RIGHT
+    //println!("TO REMOVE RANGES {:?}", to_remove_token_ranges);
+
+
+    // Step 3: 
+    // Since we have inclusive ranges of the tokens we remove, we can get ranges of tokens we keep by .windows(2)
+    // So we create token-to-keep intervals for which pieces of text to push to output 
+    // AND ngram-to-add indices for ngrams that remain here
+    let mut output_str = String::new();
+    for window in to_remove_token_ranges.windows(2) { // windows indicate the NOT_REMOVED tokens
+
+        let tok_start = window[0].1 + 1;// also the ngram start
+        let tok_end = window[1].0;
+        let ngram_end = tok_end - max_ngram_size as i32 + 1;
+        //println!("ADDING IN TOKENS [{:?})", (tok_start, tok_end));
+        //println!("ADDING IN NGRAMS [{:?})", (tok_start, ngram_end));
+        //println!("KEEP RANGE {:?} {:?}", tok_start, tok_end);
+        if tok_end <= tok_start {
+            continue;
+        }        
+
+        if !no_update_bloom_filter {
+            for ngram_idx in tok_start..ngram_end { // Add ngrams
+                bloom_filter.insert_hashes(&hashes[ngram_idx as usize]);
+            }
+        }
+        // And then push the text to output
+        output_str.push_str(&text[tokenidx2textidx[tok_start as usize]..tokenidx2textidx[tok_end as usize]]);
+    }
+    //println!("OUTPUT STR {:?}", output_str);
+    if annotate {
+        // Spans here are like [lo,hi) ... i.e. semi-open intervals
+        let mut duplicate_char_spans : Vec<(usize, usize)> = Vec::new();
+        for i in 1..to_remove_token_ranges.len() - 1 {
+            let (s, e) = to_remove_token_ranges[i];
+            duplicate_char_spans.push((tokenidx2textidx[s as usize], tokenidx2textidx[e as usize + 1]));
+        }
+
+
+        data["bff_duplicate_spans"] = serde_json::to_value(duplicate_char_spans).unwrap();
+        data["bff_contained_ngram_count"] = serde_json::to_value(bff_contained_ngram_count).unwrap();
+    } else {
+        data["text"] = Value::String(output_str.trim_end().to_string());
+    }
+
+    (data, total_bytes - output_str.len() as usize, total_bytes as usize)
+}
+
 
 
 
@@ -862,13 +1006,13 @@ async fn main() -> Result<()> {
 
     match &args.command {
         Commands::Bff {inputs, output_directory, bloom_filter_file, expected_ngram_count,
-                       fp_rate, min_ngram_size, max_ngram_size, filtering_threshold, 
+                       fp_rate, min_ngram_size, max_ngram_size, substr_seqlen, filtering_threshold, 
                        remove_type, no_update_bloom_filter, annotate,
                        threads, no_save_bloom_filter, no_progress_bar, shard_num, total_shards} =>
         {
             assert!(shard_num < total_shards, "Shard num must be < total shards");
             bff(inputs, output_directory, bloom_filter_file, expected_ngram_count,
-                fp_rate, min_ngram_size, max_ngram_size, filtering_threshold,
+                fp_rate, min_ngram_size, max_ngram_size, substr_seqlen, filtering_threshold,
                 remove_type, no_update_bloom_filter, annotate,
                 threads, no_save_bloom_filter, no_progress_bar, shard_num, total_shards).await?;
         },
@@ -887,7 +1031,7 @@ async fn main() -> Result<()> {
 
 async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Option<PathBuf>,
        expected_ngram_count: &usize, fp_rate: &f64, min_ngram_size: &usize, max_ngram_size: &usize,
-       filtering_threshold: &f64, remove_type: &RemoveType, no_update_bloom_filter: &bool,
+       substr_seqlen: &usize, filtering_threshold: &f64, remove_type: &RemoveType, no_update_bloom_filter: &bool,
        annotate: &bool, threads: &usize, no_save_bloom_filter: &bool,
        no_progress_bar: &bool, shard_num: &usize, total_shards: &usize) -> Result<()> {
 
@@ -946,6 +1090,7 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
         };
         let min_ngram_size = min_ngram_size.clone();
         let max_ngram_size = max_ngram_size.clone();
+        let substr_seqlen = substr_seqlen.clone();
         let filtering_threshold = filtering_threshold.clone();
         let remove_type = remove_type.clone();
         let no_update_bloom_filter = no_update_bloom_filter.clone();
@@ -971,6 +1116,7 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
                     &bloom_filter,
                     max_ngram_size,
                     min_ngram_size,
+                    substr_seqlen, 
                     &remove_type,
                     filtering_threshold.clone(),
                     no_update_bloom_filter.clone(),

@@ -12,7 +12,7 @@ use std::clone::Clone;
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write, Cursor};
 use std::mem::size_of;
 use std::path::{PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,10 +25,20 @@ use sysinfo::{
 };
 use glob::glob;
 use human_bytes::human_bytes;
-use std::fs::{OpenOptions, remove_file, create_dir_all};
+use std::fs::{OpenOptions, create_dir_all};
 use std::sync::{Arc, Mutex};
 use indicatif::{ProgressBar,ProgressStyle};
 use std::time::{Instant};
+
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{Client};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use tokio::io::AsyncReadExt;
+use tokio::io::BufReader as tBufReader;
+use tokio::time::{Duration, sleep};
+use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 
 
 #[derive(Parser)]
@@ -455,7 +465,7 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: b
 
 
 #[allow(clippy::too_many_arguments)] // TODO : abstract parameters into a struct
-fn process_file(
+async fn process_file(
     input_file: &PathBuf,
     output_file: &PathBuf,
     bloom_filter: &Arc<BloomFilter>,
@@ -469,31 +479,39 @@ fn process_file(
 ) -> Result<(usize, usize), io::Error> {
 
     // Setup input/output writers
-    let input_file = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .create(false)
-        .open(input_file)?;
-    let reader = BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file));
+    // If input file is local: can stream pretty easily/robustly
+    // If input file is s3: load entire file and split it into thing that implements .lines() iterator
+    let lines : Box<dyn Iterator<Item = Result<String, std::io::Error>>> = if is_s3(input_file) {
+        /*
+        let input_file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(input_file)?;
+        BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines()        
+        */
+        Box::new(get_reader_from_s3(input_file, None).await.unwrap().lines())
+    } else {
 
-    let output_file_pathbuf = output_file;
-    let output_file = OpenOptions::new()
-        .read(false)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(output_file)?;
-    let mut writer = BufWriter::with_capacity(
-        1024 * 1024,
-        GzEncoder::new(output_file, Compression::default()),
-    );
+        let input_file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(input_file)?;
+        Box::new(BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines())
+    };
+
+    // If output file is local, write directly to file
+    let mut output_data: Vec<u8> = Vec::new();
+    let mut writer = BufWriter::with_capacity(1024 * 1024, GzEncoder::new(Cursor::new(&mut output_data), Compression::default()));
+
 
     // Loop over lines and do bff stuff
     let mut count = 0;
     let mut fully_skipped = 0;
     let mut removed_text_bytes = 0;
     let mut total_text_bytes = 0;
-    for line in reader.lines() {
+    for line in lines {
         count += 1;
         let (dedup_data, removed_line_bytes, total_line_bytes) = process_line(&line.unwrap(), &bloom_filter,
                                                                            min_ngram_size, max_ngram_size,
@@ -510,9 +528,35 @@ fn process_file(
         }        
     }
 
-    if count == fully_skipped {
-        remove_file(output_file_pathbuf)?;
+    // Handle output files
+    writer.flush()?;
+    let encoder = writer.into_inner().expect("Failed to get encoder");
+    encoder.finish().unwrap();
+    if fully_skipped < count {
+        if is_s3(output_file) {
+            println!("Starting upload to {:?}", output_file);
+            let (output_bucket, output_key) = split_s3_path(output_file);
+            let client = get_s3_client().await;
+            let _ = client
+                .put_object()
+                .bucket(output_bucket)
+                .key(output_key)
+                .body(ByteStream::from(output_data))
+                .send()
+                .await;            
+            println!("Finished upload");
+        } else {
+            let mut output_file = OpenOptions::new()
+                .read(false)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(output_file)?;            
+            output_file.write_all(&output_data)?;
+        }
     }
+
+
     match pbar_option {
         Some(pbar) => {
             let pb = pbar.lock().unwrap();
@@ -640,10 +684,18 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
 =                       I/O Stuff                        =
 ========================================================*/
 
-fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files = vec![];
+async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {    
+    // Can handle both local and s3 files/directories
+    // Note that this function is async because we need to wait for all the s3 files to get expanded
+    // Also note that the output vector is SORTED (in case S3 has inconsistent list_objects_v2 ordering)
+    let mut files: Vec<PathBuf> = Vec::new();
     for path in paths {
-        if path.is_dir() {
+        if is_s3(path) {
+            let s3_result = expand_s3_dirs(path).await?;
+            for file in s3_result {
+                files.push(file.clone());
+            }
+        } else if path.is_dir() {
             let path_str = path
                 .to_str()
                 .ok_or_else(|| anyhow!("invalid path '{}'", path.to_string_lossy()))?;
@@ -653,11 +705,105 @@ fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         } else {
             files.push(path.clone());
         }
-    }
+    }   
+    files.sort();
     Ok(files)
 }
 
+
+async fn expand_s3_dirs(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
+    let mut s3_files: Vec<PathBuf> = Vec::new();
+
+    let (bucket, prefix) = split_s3_path(s3_uri);
+    let region_provider = RegionProviderChain::default_provider();
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let mut response = client
+        .list_objects_v2()    
+        .bucket(bucket.to_owned())
+        .prefix(prefix.to_owned())
+        .into_paginator()
+        .send();
+
+    while let Some(result) = response.next().await {
+        match result {
+            Ok(output) => {
+                for object in output.contents() {
+                    let key = object.key().unwrap();
+                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz")) {
+                        continue;
+                    }
+                    let mut s3_file = PathBuf::from("s3://");
+                    s3_file.push(bucket.clone());
+                    s3_file.push(key);
+                    s3_files.push(s3_file);
+                }
+            }
+            Err(err) => {
+                eprintln!("Error collecting S3 files | {err:?}")
+            }
+        }
+    }
+    Ok(s3_files)
+}
+
+
+async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
+    let mut attempts = 0;
+    let base_delay = Duration::from_millis(100);
+    let max_delay = Duration::from_millis(2000);
+
+    let mut rng = rand::thread_rng();
+    let client = get_s3_client().await;
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempts < num_retries => {
+                // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
+                // same time.
+                println!("Error {}/{}: {}", e, attempts, num_retries);
+                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
+                let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
+                if exponential_delay > max_delay {
+                    exponential_delay = max_delay;
+                }
+                sleep(exponential_delay + random_delay).await;
+                attempts += 1;
+            }
+            Err(e) => {
+                println!("Too many errors reading: {}. Giving up.", key);
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+
+
+async fn get_reader_from_s3(path: &PathBuf, num_retries: Option<usize>) -> Result<BufReader<Cursor<Vec<u8>>>>{
+    // Gets all the data from an S3 file and loads it into memory and returns a Bufreader over it
+    let num_retries = num_retries.unwrap_or(5);
+    let (s3_bucket, s3_key) = split_s3_path(path);
+    let object = get_object_with_retry(&s3_bucket, &s3_key, num_retries).await?;
+    let body_stream = object.body.into_async_read();
+    let gz = asyncGZ::new(body_stream);
+    let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
+
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    let cursor = Cursor::new(data);
+
+    Ok(BufReader::new(cursor))
+}
+
 fn create_dir_if_not_exists(path: &PathBuf) -> Result<(), std::io::Error> {
+    if is_s3(path) {
+        return Ok(()); // S3 bucket/prefixes always already exist
+    }
     match create_dir_all(path) {
         Ok(_) => Ok(()),
         Err(err) => {
@@ -670,14 +816,50 @@ fn create_dir_if_not_exists(path: &PathBuf) -> Result<(), std::io::Error> {
     }
 }
 
+fn split_s3_path(path: &PathBuf) -> (String, String) {
+    // Splits s3_uri into (bucket, key)
+    let path_str = path.to_str().expect("Invalid path");
+
+    let path_without_scheme = path_str
+        .strip_prefix("s3://")
+        .expect("Path must start with 's3://'");
+
+    let slash_index = path_without_scheme
+        .find('/')
+        .expect("Path must contain a slash after the bucket name");
+
+    let bucket = &path_without_scheme[..slash_index];
+    let key = &path_without_scheme[slash_index + 1..];
+    (bucket.to_string(), key.to_string())
+}
+
+
+fn is_s3(path: &PathBuf) -> bool {
+    if let Some(s) = path.to_str() {
+        s.starts_with("s3://")
+    } else {
+        false
+    }
+}
+
+async fn get_s3_client() -> Client {
+    let region_provider = RegionProviderChain::default_provider();
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    Client::new(&config)
+}
+
+
 
 /*=============================================================
 =                       Main Function                         =
 =============================================================*/
 
 
-
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = ArgParser::parse();
 
     match &args.command {
@@ -690,7 +872,7 @@ fn main() -> Result<()> {
             bff(inputs, output_directory, bloom_filter_file, expected_ngram_count,
                 fp_rate, min_ngram_size, max_ngram_size, filtering_threshold,
                 remove_type, no_update_bloom_filter, annotate,
-                threads, no_save_bloom_filter, no_progress_bar, shard_num, total_shards)?;
+                threads, no_save_bloom_filter, no_progress_bar, shard_num, total_shards).await?;
         },
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
@@ -705,7 +887,7 @@ fn main() -> Result<()> {
 
 
 
-fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Option<PathBuf>,
+async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Option<PathBuf>,
        expected_ngram_count: &usize, fp_rate: &f64, min_ngram_size: &usize, max_ngram_size: &usize,
        filtering_threshold: &f64, remove_type: &RemoveType, no_update_bloom_filter: &bool,
        annotate: &bool, threads: &usize, no_save_bloom_filter: &bool,
@@ -720,7 +902,8 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Op
 
 
     // Setup input files
-    let all_inputs = expand_dirs(inputs).unwrap();
+    let all_inputs = expand_dirs(inputs).await?;
+
     let mut shard: Vec<PathBuf> = Vec::new();
     let mut idx = *shard_num;
     while idx < all_inputs.len() {
@@ -736,7 +919,6 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Op
     } else {
         *threads
     };
-
     // Setup progress bar
     let pbar = ProgressBar::new(shard.len() as u64)
         .with_style(
@@ -779,24 +961,37 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Op
             if no_progress_bar {
                 println!("Processing {input:?}...");
             }
-            let (removed_doc_bytes, total_doc_bytes) = process_file(
-                &input,
-                &output,
-                &bloom_filter,
-                max_ngram_size,
-                min_ngram_size,
-                &remove_type,
-                filtering_threshold.clone(),
-                no_update_bloom_filter.clone(),
-                annotate.clone(),
-                &pbar_option
-                ).unwrap();
 
-            let mut total_guard = total_bytes.lock().unwrap();
-            *total_guard += total_doc_bytes;
-
-            let mut removed_guard = removed_bytes.lock().unwrap();
-            *removed_guard += removed_doc_bytes;            
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();            
+            let result = rt.block_on(
+                process_file(
+                    &input,
+                    &output,
+                    &bloom_filter,
+                    max_ngram_size,
+                    min_ngram_size,
+                    &remove_type,
+                    filtering_threshold.clone(),
+                    no_update_bloom_filter.clone(),
+                    annotate.clone(),
+                    &pbar_option
+                    )                
+                );
+            match result {
+                Ok(outputs) => {
+                    let (removed_doc_bytes, total_doc_bytes) = outputs;
+                    let mut total_guard = total_bytes.lock().unwrap();
+                    *total_guard += total_doc_bytes;
+                    let mut removed_guard = removed_bytes.lock().unwrap();
+                    *removed_guard += removed_doc_bytes;                        
+                },
+                Err(err) => {
+                    eprintln!("Error processing {:?}; {:?}", input, err);
+                }
+            }        
         });
     }
     threadpool.join();

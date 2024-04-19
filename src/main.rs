@@ -193,6 +193,21 @@ enum Commands {
         num_global_retries: usize,
     },
 
+    CountNgramsRemote {
+        #[arg(required=true, long)]
+        bucket: String,
+
+        #[arg(required=true, long)]
+        input_dir: String,
+
+        #[command(flatten)]
+        bff_args: BffArgs,
+
+        // Local number of retries; we try to load each file from s3 this many times.
+        #[arg(long, default_value_t=3)]
+        num_retries: usize,
+    },
+
     Sysreq {
         #[arg(required=true, long)]
         expected_ngram_count: usize,
@@ -809,8 +824,139 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, bff_args: &BffArgs) -
     (data, removed_items, total_items)
 }
 
+async fn count_file_ngrams_s3(
+    s3_bucket: &String,
+    s3_input: &String,
+    bff_args: &BffArgs,
+    pbar_option: &Option<Arc<Mutex<ProgressBar>>>,
+    num_retries: usize,
+) -> Result<usize, Error> {
+    let region_provider = RegionProviderChain::default_provider();
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
 
+    let object = get_object_with_retry(&client, s3_bucket, s3_input, num_retries).await?;
+    let body_stream = object.body.into_async_read();
+    let gz = asyncGZ::new(body_stream);
+    let reader = tBufReader::with_capacity(1024 * 1024, gz);
+    let mut lines_iter = reader.lines();
 
+    let mut ngram_count: usize = 0;
+    while let Some(line) = lines_iter.next_line().await? {
+        let data: Value = serde_json::from_str(&line).unwrap();
+        let text = data["text"].as_str().unwrap();
+        let mut ngram: VecDeque<&str> = VecDeque::with_capacity(bff_args.max_ngram_size);
+        for token in tokenize(text) {
+            ngram.push_back(token);
+            if ngram.len() >= bff_args.max_ngram_size {
+                ngram_count += 1;
+                ngram.pop_front();
+            }
+        }
+        if !ngram.is_empty() && ngram.len() >= bff_args.min_ngram_size {
+            ngram_count += 1;
+        }
+    }
+
+    match pbar_option {
+        Some(pbar) => pbar.lock().unwrap().inc(1),
+        None => (),
+    }
+
+    Ok(ngram_count)
+}
+
+async fn count_ngrams_remote(
+    bucket: &String,
+    input_dir: &String,
+    bff_args: &BffArgs,
+    num_retries: &usize,
+) -> std::io::Result<()> {
+    let start_time = Instant::now();
+    let io_pairs = gather_s3_io(
+        bucket,
+        input_dir,
+        "", // output_dir not needed
+        bff_args.shard_num,
+        bff_args.total_shards,
+    )
+    .await
+    .unwrap();
+
+    println!("Collected {} input files...", io_pairs.len());
+    let num_files = io_pairs.len();
+    let pbar = ProgressBar::new(num_files as u64)
+        .with_style(
+            ProgressStyle::with_template(
+                "Files {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]",
+            )
+            .unwrap(),
+        );
+    let pbar = Arc::new(Mutex::new(pbar));
+    println!(
+        "Completed setup phase in {:?} seconds",
+        start_time.elapsed().as_secs()
+    );
+    if !bff_args.no_progress {
+        pbar.lock().unwrap().inc(0); // initializes pbar
+    }
+
+    let loop_start_time = Instant::now();
+    let total_ngrams = Arc::new(Mutex::new(0));
+    let threads = if bff_args.threads == 0 {
+        available_parallelism().unwrap().get()
+    } else {
+        bff_args.threads
+    };
+    let threadpool = ThreadPool::new(threads);
+
+    for io_pair in &io_pairs {
+        let num_retries = (*num_retries).clone();
+        let bucket = bucket.clone();
+        let bff_args = bff_args.clone();
+        let total_ngrams = Arc::clone(&total_ngrams);
+        let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if bff_args.no_progress {
+            None
+        } else {
+            Some(pbar.clone())
+        };
+        let (input_path, _) = io_pair.clone();
+
+        threadpool.execute(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(count_file_ngrams_s3(
+                &bucket,
+                &input_path,
+                &bff_args,
+                &pbar_option,
+                num_retries,
+            ));
+            match result {
+                Ok(ngram_count) => {
+                    let mut ngram_guard = total_ngrams.lock().unwrap();
+                    *ngram_guard += ngram_count;
+                }
+                Err(err) => {
+                    eprintln!("Error counting ngrams for {}; {:?}", input_path, err);
+                }
+            }
+        });
+    }
+
+    threadpool.join();
+    println!(
+        "Completed counting ngrams in all files in {:?} seconds",
+        loop_start_time.elapsed().as_secs()
+    );
+    println!("Total ngrams: {}", total_ngrams.lock().unwrap());
+    Ok(())
+}
 
 fn tokenize(s: &str) -> impl Iterator<Item = &str> {
     s.split_word_bounds().filter(|w| {
@@ -936,7 +1082,13 @@ async fn main() -> std::io::Result<()> {
         Commands::BffRemote {bucket, input_dir, output_dir, bff_args, num_retries, num_global_retries} => {
             assert!(bff_args.shard_num < bff_args.total_shards, "Shard num must be <= total shards");
             bff_remote(bucket, input_dir, output_dir, &bff_args, num_retries, num_global_retries).await?;
-        }
+        },
+
+        Commands::CountNgramsRemote {bucket, input_dir, bff_args, num_retries} => {
+            assert!(bff_args.shard_num < bff_args.total_shards, "Shard num must be <= total shards");
+            count_ngrams_remote(bucket, input_dir, &bff_args, num_retries).await?;
+        },
+
         Commands::Sysreq {expected_ngram_count, fp_rate} => {
             let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
             let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count);

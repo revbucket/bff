@@ -168,6 +168,9 @@ enum RemoveType {
     /// Does substring style removal
     Substring,
 
+    /// Does exact removal (it's not _really_ exact, shhh....)
+    Exact,
+
 }
 
 
@@ -532,9 +535,10 @@ async fn process_file(
     let mut total_text_bytes = 0;
     for line in lines {
         count += 1;
-
-
-        let (dedup_data, removed_line_bytes, total_line_bytes) = if *remove_type != RemoveType::Substring {
+        let (dedup_data, removed_line_bytes, total_line_bytes) = 
+        if *remove_type == RemoveType::Exact {
+            process_line_exact(&line.unwrap(), &bloom_filter, no_update_bloom_filter, annotate)
+        } else if *remove_type != RemoveType::Substring {
             process_line(&line.unwrap(), &bloom_filter, min_ngram_size, max_ngram_size,
                          remove_type, filtering_threshold, no_update_bloom_filter, annotate)
         } else {
@@ -808,7 +812,6 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
             duplicate_char_spans.push((tokenidx2textidx[s as usize], tokenidx2textidx[e as usize + 1]));
         }
 
-
         data["bff_duplicate_spans"] = serde_json::to_value(duplicate_char_spans).unwrap();
         data["bff_contained_ngram_count"] = serde_json::to_value(bff_contained_ngram_count).unwrap();
     } else {
@@ -818,6 +821,38 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
     (data, total_bytes - output_str.len() as usize, total_bytes as usize)
 }
 
+
+fn process_line_exact(line: &String, bloom_filter: &BloomFilter, no_update_bloom_filter: bool, annotate: bool) ->
+    (serde_json::Value, usize, usize) {
+    // Hacky "exact dedup" using bloom filters
+    // Just hashes the WHOLE text 
+
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let mut removed_bytes = 0;
+
+    let text = data["text"].as_str().unwrap();
+    let total_bytes = text.len();
+    let mut fake_ngram: VecDeque<&str> = VecDeque::with_capacity(1);
+    fake_ngram.push_back(text);
+    let hashes = bloom_filter.hashes(&fake_ngram);
+
+    if bloom_filter.contains_hashes(&hashes) {
+        // If we've seen this before, modify text XOR annotate 
+        if annotate {
+            data["bff_exact_duplicate"] = serde_json::to_value(true).unwrap();
+        } else {
+            data["text"] = Value::String(String::new());
+        }
+        removed_bytes = total_bytes;
+    } else {
+        // If we haven't seen this before, insert it
+        if !no_update_bloom_filter {
+            bloom_filter.insert_hashes(&hashes);
+        }
+    }   
+
+    return (data, removed_bytes, total_bytes)
+}
 
 
 

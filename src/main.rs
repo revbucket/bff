@@ -39,6 +39,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
+use async_compression::tokio::bufread::ZstdDecoder as asyncZstd;
 
 
 #[derive(Parser)]
@@ -927,7 +928,7 @@ async fn expand_s3_dirs(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
             Ok(output) => {
                 for object in output.contents() {
                     let key = object.key().unwrap();
-                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz")) {
+                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd")) {
                         continue;
                     }
                     let mut s3_file = PathBuf::from("s3://");
@@ -983,13 +984,19 @@ async fn get_reader_from_s3(path: &PathBuf, num_retries: Option<usize>) -> Resul
     let (s3_bucket, s3_key) = split_s3_path(path);
     let object = get_object_with_retry(&s3_bucket, &s3_key, num_retries).await?;
     let body_stream = object.body.into_async_read();
-    let gz = asyncGZ::new(body_stream);
-    let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
-
     let mut data = Vec::new();
-    reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
-    let cursor = Cursor::new(data);
 
+    if path.extension().unwrap() == "zstd" {
+        let zstd = asyncZstd::new(body_stream);
+        let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    } else {
+        let gz = asyncGZ::new(body_stream);
+        let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    }
+    let cursor = Cursor::new(data);
     Ok(BufReader::new(cursor))
 }
 

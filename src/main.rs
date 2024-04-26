@@ -105,6 +105,12 @@ enum Commands {
         #[arg(long, default_value_t = RemoveType::Paragraph, value_enum)]
         remove_type: RemoveType,        
 
+
+        /// Number of hashers to use in bloom filter 
+        /// 0 is the default in which case we use the optimal number 
+        #[arg(long, default_value_t = 0)]
+        num_hashers: usize,
+
         /// Whether or not to update the bloom filter. If this is true, the filter is not updated, but
         /// the input is still deduplicated based on the filter. Default is false.
         #[arg(long, default_value_t = false)]
@@ -146,7 +152,9 @@ enum Commands {
         #[arg(required=true, long)]
         expected_ngram_count: usize,
         #[arg(required=true, long)]
-        fp_rate: f64
+        fp_rate: f64,
+        #[arg(long, default_value_t=0)]
+        num_hashers: usize,
     },
         
 }
@@ -402,7 +410,7 @@ impl BloomFilter {
     }
 
 
-    fn from_args(bloom_filter_file: Option<PathBuf>, expected_ngram_count: usize, fp_rate: f64,) -> Self {
+    fn from_args(bloom_filter_file: Option<PathBuf>, expected_ngram_count: usize, fp_rate: f64, num_hashers: usize) -> Self {
         /* Uses the CLI args to build a bloom filter 
         Logic:
             - Check if file exists, if so, just load it and return 
@@ -419,7 +427,7 @@ impl BloomFilter {
             }
             _ => {
             println!("Creating new bloom filter...");
-            let bloom_filter_size = compute_bloom_size(fp_rate, expected_ngram_count, true);
+            let bloom_filter_size = compute_bloom_size(fp_rate, expected_ngram_count, true, num_hashers);
             let num_hashers = BloomFilter::optimal_number_of_hashers(
                 bloom_filter_size,
                 expected_ngram_count,
@@ -438,7 +446,7 @@ impl BloomFilter {
 
 
 
-fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: bool) -> usize {
+fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: bool, num_hashers: usize) -> usize {
     /* Uses binary search to find optimal size of bloom filter using optimal number of hashers
        and provided ngram counts
     */
@@ -455,10 +463,16 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: b
                     420_744_073_709_551_615 as usize
                  };
 
+    let compute_hashers = num_hashers == 0;
 
     // Save some time by checking endpoint first
-    if limit_to_sys && BloomFilter::prob_of_false_positive(hi, expected_ngram_count, 
-                                           BloomFilter::optimal_number_of_hashers(hi, expected_ngram_count)) > fp_rate {
+    let num_hashers = if compute_hashers {
+         BloomFilter::optimal_number_of_hashers(hi, expected_ngram_count)
+    } else {
+        num_hashers
+    };
+
+    if limit_to_sys && BloomFilter::prob_of_false_positive(hi, expected_ngram_count, num_hashers) > fp_rate {
         println!(
             "WARNING: To achieve desired false-positive rate, you'd need >90% of system RAM. Defaulting to 90% \
             system RAM.");
@@ -468,7 +482,9 @@ fn compute_bloom_size(fp_rate: f64, expected_ngram_count: usize, limit_to_sys: b
     // Then do binary search to find optimal size
     while lo < hi-1 {
         let mid = lo + (hi - lo) / 2;
-        let num_hashers = BloomFilter::optimal_number_of_hashers(mid, expected_ngram_count);
+        let num_hashers = if compute_hashers {
+            BloomFilter::optimal_number_of_hashers(mid, expected_ngram_count)
+        } else {num_hashers};
         let computed_fp = BloomFilter::prob_of_false_positive(mid, expected_ngram_count, num_hashers) ;
         if computed_fp > fp_rate {
             // FP rate too high, need to go bigger
@@ -1042,18 +1058,20 @@ async fn main() -> Result<()> {
     match &args.command {
         Commands::Bff {inputs, output_directory, bloom_filter_file, expected_ngram_count,
                        fp_rate, min_ngram_size, max_ngram_size, substr_seqlen, filtering_threshold, 
-                       remove_type, no_update_bloom_filter, annotate,
+                       remove_type, num_hashers, no_update_bloom_filter, annotate,
                        threads, no_save_bloom_filter, no_progress_bar, shard_num, total_shards} =>
         {
             assert!(shard_num < total_shards, "Shard num must be < total shards");
             bff(inputs, output_directory, bloom_filter_file, expected_ngram_count,
                 fp_rate, min_ngram_size, max_ngram_size, substr_seqlen, filtering_threshold,
-                remove_type, no_update_bloom_filter, annotate,
+                remove_type, num_hashers, no_update_bloom_filter, annotate,
                 threads, no_save_bloom_filter, no_progress_bar, shard_num, total_shards).await?;
         },
-        Commands::Sysreq {expected_ngram_count, fp_rate} => {
-            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false);
-            let num_hashers = BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count);
+        Commands::Sysreq {expected_ngram_count, num_hashers, fp_rate} => {
+            let bff_size = compute_bloom_size(*fp_rate, *expected_ngram_count, false, *num_hashers);
+            let num_hashers = if *num_hashers == 0 {
+                    BloomFilter::optimal_number_of_hashers(bff_size, *expected_ngram_count)
+                } else {*num_hashers};
             println!("To handle {} tokens with fp rate {}, you'd need a filter of size {} and {} hashers",
                      expected_ngram_count, fp_rate, human_bytes(bff_size as f64), num_hashers);            
         },
@@ -1066,8 +1084,8 @@ async fn main() -> Result<()> {
 
 async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_file: &Option<PathBuf>,
        expected_ngram_count: &usize, fp_rate: &f64, min_ngram_size: &usize, max_ngram_size: &usize,
-       substr_seqlen: &usize, filtering_threshold: &f64, remove_type: &RemoveType, no_update_bloom_filter: &bool,
-       annotate: &bool, threads: &usize, no_save_bloom_filter: &bool,
+       substr_seqlen: &usize, filtering_threshold: &f64, remove_type: &RemoveType, num_hashers: &usize, 
+       no_update_bloom_filter: &bool, annotate: &bool, threads: &usize, no_save_bloom_filter: &bool,
        no_progress_bar: &bool, shard_num: &usize, total_shards: &usize) -> Result<()> {
 
 
@@ -1075,7 +1093,8 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
     // Set up {output_location, filter, inputs, threading, progress bar}
     let start_time = Instant::now();
     create_dir_if_not_exists(output_directory).unwrap(); 
-    let bloom_filter = Arc::new(BloomFilter::from_args(bloom_filter_file.clone(), *expected_ngram_count, *fp_rate)); 
+    let bloom_filter = Arc::new(BloomFilter::from_args(bloom_filter_file.clone(), *expected_ngram_count, 
+                                *fp_rate, *num_hashers)); 
 
 
     // Setup input files

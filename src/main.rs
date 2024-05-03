@@ -1128,7 +1128,6 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
     }
     let mut rng = thread_rng();
     shard.shuffle(&mut rng); 
-    shard.truncate(100); // REMOVE! 
     // Setup threads
     let threads = if *threads == 0 {
         available_parallelism().unwrap().get()
@@ -1157,7 +1156,6 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
     for input in shard {
         //let output = output_directory.clone().join(input.file_name().unwrap());
         let output = get_output_filename(inputs, &input, output_directory);
-        println!("INPUT OUTPUT {:?} | {:?}", input, output);
         let bloom_filter = bloom_filter.clone();
         let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if *no_progress_bar {
             None

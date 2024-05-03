@@ -905,6 +905,7 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 
+
 async fn expand_s3_dirs(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
     let mut s3_files: Vec<PathBuf> = Vec::new();
 
@@ -1052,6 +1053,18 @@ async fn get_s3_client() -> Client {
 }
 
 
+fn get_output_filename(inputs: &[PathBuf], input_filename: &PathBuf, output_directory: &PathBuf) -> PathBuf {
+    // More fancy output-file naming that no longer assumes unique inputs
+    let matching_prefix = inputs
+        .iter()
+        .find(|pfx| input_filename.starts_with(pfx))
+        .expect("No matching prefix found?!?");
+
+    let relative_path = input_filename.strip_prefix(matching_prefix).unwrap();
+    output_directory.clone().join(relative_path)
+
+}
+
 
 /*=============================================================
 =                       Main Function                         =
@@ -1114,8 +1127,8 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
         idx += total_shards;
     }
     let mut rng = thread_rng();
-    shard.shuffle(&mut rng);
-
+    shard.shuffle(&mut rng); 
+    shard.truncate(100); // REMOVE! 
     // Setup threads
     let threads = if *threads == 0 {
         available_parallelism().unwrap().get()
@@ -1142,7 +1155,9 @@ async fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bloom_filter_fil
     let removed_bytes = Arc::new(Mutex::new(0));
     let threadpool = ThreadPool::new(threads);
     for input in shard {
-        let output = output_directory.clone().join(input.file_name().unwrap());
+        //let output = output_directory.clone().join(input.file_name().unwrap());
+        let output = get_output_filename(inputs, &input, output_directory);
+        println!("INPUT OUTPUT {:?} | {:?}", input, output);
         let bloom_filter = bloom_filter.clone();
         let pbar_option: Option<Arc<Mutex<ProgressBar>>> = if *no_progress_bar {
             None

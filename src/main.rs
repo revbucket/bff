@@ -551,17 +551,35 @@ async fn process_file(
     let mut removed_text_bytes = 0;
     let mut total_text_bytes = 0;
     for line in lines {
+        let line = line?;
         count += 1;
-        let (dedup_data, removed_line_bytes, total_line_bytes) = 
-        if *remove_type == RemoveType::Exact {
-            process_line_exact(&line.unwrap(), &bloom_filter, no_update_bloom_filter, annotate)
-        } else if *remove_type != RemoveType::Substring {
-            process_line(&line.unwrap(), &bloom_filter, min_ngram_size, max_ngram_size,
-                         remove_type, filtering_threshold, no_update_bloom_filter, annotate)
-        } else {
-            process_line_substring(&line.unwrap(), &bloom_filter, max_ngram_size,
-                                   no_update_bloom_filter, annotate, substr_seqlen)
+        let (dedup_data, removed_line_bytes, total_line_bytes) = match *remove_type {
+            RemoveType::Exact => {
+                process_line_exact(&line, &bloom_filter, no_update_bloom_filter, annotate)
+            }
+            RemoveType::Substring => {
+                process_line_substring(&line, &bloom_filter, max_ngram_size,
+                                   no_update_bloom_filter, annotate, substr_seqlen)                
+            }
+            RemoveType::Both => {
+                // Dumb version: check if document should be removed
+                let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
+                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                         &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate);
+                if doc_removed_bytes > 0 { 
+                    (doc_dedup, doc_removed_bytes, doc_total_bytes)
+                } else { // and if document should NOT be removed, then do paragraph level
+                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                         &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)     
+                } 
+                    
+            }
+            _ => { // Handles the "paragraph" and "document" case (but not "both" [for now]!)
+                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                         remove_type, filtering_threshold, no_update_bloom_filter, annotate)             
+            }
         };
+
         removed_text_bytes += removed_line_bytes;
         total_text_bytes += total_line_bytes;
         if dedup_data.get("text").unwrap().as_str().unwrap().trim().is_empty() {
@@ -994,7 +1012,6 @@ async fn get_reader_from_s3(path: &PathBuf, num_retries: Option<usize>) -> Resul
     } else {
         let gz = asyncGZ::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
-        let mut data = Vec::new();
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
     }
     let cursor = Cursor::new(data);

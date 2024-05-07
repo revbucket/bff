@@ -174,6 +174,10 @@ enum RemoveType {
     /// Does paragraph removal, BUT if enough of the paragraph ngram checks are contained, removes the whole document
     Both,     
 
+    /// Does Both like above, but does it in the naive way by doing doc level first and then paragraph level
+    /// Warning: There are some SUBTLE differences between the output of RemoveType::Both and RemoveType::NaiveBoth, 
+    NaiveBoth,
+
     /// Does substring style removal
     Substring,
 
@@ -563,6 +567,9 @@ async fn process_file(
             }
             RemoveType::Both => {
                 // Dumb version: check if document should be removed
+                process_line_both(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                                  filtering_threshold, no_update_bloom_filter, annotate)
+                /*
                 let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
                          &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate);
@@ -572,7 +579,19 @@ async fn process_file(
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
                          &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)     
                 } 
+                */
                     
+            }
+            RemoveType::NaiveBoth => {
+                let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
+                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                         &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate);
+                if doc_removed_bytes > 0 { 
+                    (doc_dedup, doc_removed_bytes, doc_total_bytes)
+                } else { // and if document should NOT be removed, then do paragraph level
+                    process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                         &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)     
+                }                 
             }
             _ => { // Handles the "paragraph" and "document" case (but not "both" [for now]!)
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
@@ -614,6 +633,7 @@ async fn process_file(
                 .truncate(true)
                 .open(output_file)?;            
             output_file.write_all(&output_data)?;
+            
         }
     }
 
@@ -854,6 +874,199 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
     }
 
     (data, total_bytes - output_str.len() as usize, total_bytes as usize)
+}
+
+
+fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size: usize,
+               filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool) -> 
+    (serde_json::Value, usize, usize) {
+
+    /* Actual paragraph+document level deduplication (but quite complicated)
+    Here's the plan:
+    1. tokenize the string and create ngram shinglings and hash each of them, get containments
+        a. store each hash in a separate paragraph-level bucket
+        b. store any ngram that spans across >1 paragraph in a separate bucket 
+    2. Check document level containment
+        a. If enough of the seen ngrams are contained, we remove the whole document
+
+    3. Check paragraphs: for each paragraph...
+        a. Check if enough of its ngrams have been seen before. 
+        b. If so, mark this as deleted
+        c. If not, add to output text, and insert all of its ngram-hashes to the bloom filter
+        d. check the ngrams that span across paragraphs. While 
+            i. if the earliest ngram ends before the current paragraph starts, it survived, so we add it to the bloom filter
+            ii. if the earliest ngram intersects the current paragraph AND we should delete the current paragraph, 
+                delete it from the list. Otherwise, leave it and continue the paragraph looper
+    4. Process output as usual
+    */
+
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let text = data["text"].as_str().unwrap();
+    let total_bytes = text.len();
+
+    let mut newlines = Vec::new();
+    newlines.push(0);
+    for i in text.match_indices('\n') {
+        newlines.push(i.0)
+    }
+    newlines.push(text.len());
+    let num_paragraphs_plus1 = newlines.len();
+
+
+    // Some data structures:
+    // Map paragraph_id -> 
+    //                     all hashes for that paragraph
+    //                     num_ngrams
+    //                     contained_ngrams
+
+    let mut total_ngram_hashes: Vec<Vec<Vec<u64>>> = vec![Vec::new(); num_paragraphs_plus1];
+    let mut total_ngram_counts: Vec<usize> = vec![0; num_paragraphs_plus1];
+    let mut contained_ngram_counts: Vec<usize> = vec![0; num_paragraphs_plus1];
+
+    let mut overflow_idxs: Vec<(usize, usize)> = Vec::new(); 
+    // ^contains (first_tok.text_idx, last_tok.text_idx) for each ngram in last_idx of totals [overflow idx]
+
+
+    let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
+    let mut ngram_idxs: VecDeque<usize> = VecDeque::with_capacity(max_ngram_size);
+    let mut paragraph_idx = 0;
+    let mut seen_one_ngram = false;
+    for (text_idx, token) in tokenize_indices(text) {
+        ngram.push_back(token);
+        ngram_idxs.push_back(text_idx);
+
+        if ngram.len() >= max_ngram_size {
+            // ngram is long enough! Compute hashes, containment, and which paragraph (if any)
+            seen_one_ngram = true;
+            let hashes = bloom_filter.hashes(&ngram);
+            let contains = bloom_filter.contains_hashes(&hashes);
+            let paragraph_idx_end = newlines[paragraph_idx + 1];
+            let cur_paragraph = if text_idx < paragraph_idx_end {
+                paragraph_idx
+            } else {
+                overflow_idxs.push((*ngram_idxs.front().unwrap(), text_idx));
+                num_paragraphs_plus1 - 1 // not fully in any single para => last index                
+            };
+
+            // Adjust state for this ngram for its corresponding paragraph
+            total_ngram_counts[cur_paragraph] += 1;
+            total_ngram_hashes[cur_paragraph].push(hashes);
+            contained_ngram_counts[cur_paragraph] += contains as usize;
+            ngram.pop_front();
+            ngram_idxs.pop_front();
+
+            // Adjust paragraph index accordingly
+            let front_idx = ngram_idxs.front().unwrap();
+            while *front_idx < newlines[paragraph_idx] {
+                paragraph_idx += 1;
+            }
+        }
+    }
+    // Handle special case if full string is too small
+    if min_ngram_size <= ngram.len() && !seen_one_ngram {
+        // Short document, only one ngram, goes in the last index, basically a 'document' removal case
+        let hashes = bloom_filter.hashes(&ngram);
+        let contains = bloom_filter.contains_hashes(&hashes);
+        let cur_paragraph = num_paragraphs_plus1 - 1;
+
+        total_ngram_hashes[cur_paragraph].push(hashes);
+        total_ngram_counts[cur_paragraph] += 1;
+        contained_ngram_counts[cur_paragraph] += contains as usize;
+    }
+
+    // Now check for containment of document
+    let total_ngrams: usize = total_ngram_counts.iter().sum::<usize>();
+    let total_contains: usize = contained_ngram_counts.iter().sum::<usize>();
+    
+    if total_ngrams == 0 { // No ngrams, doc was too short, return defaults
+        return (data, 0, total_bytes as usize);
+    }
+
+    if (total_contains as f64) / total_ngrams as f64 >= filtering_threshold { // remove whole doc
+        if annotate {
+            let dup_span: Vec<Vec<usize>> = vec![vec![0, total_bytes]];
+            data["bff_duplicate_spans"] = serde_json::to_value(dup_span).unwrap();
+            data["bff_contained_ngram_count"] = serde_json::to_value(total_contains).unwrap();
+        }  else {
+            data["text"] = Value::String(String::new());
+        }
+        return (data, total_bytes, total_bytes)
+    }
+
+    // Okay, now do a clever interleaved loop over the paragraphs
+    // At the end want to:
+    // 1. Build up new text 
+    // 2. Build up removal spans 
+    // 3. Add hashes ONLY of what survived
+
+    // Trick here is to loop over paragraphs and keep track of 'survivable' hashes in the overflow
+    overflow_idxs.reverse();    
+    let mut overflow_hashes = total_ngram_hashes[total_ngram_hashes.len() - 1].clone();
+    overflow_hashes.reverse();
+    let mut duplicate_spans: Vec<Vec<usize>> = vec![];
+    let mut output_text = String::new();
+    for cur_paragraph in 0..num_paragraphs_plus1-1 {
+        let to_remove = if total_ngram_counts[cur_paragraph] == 0 {
+            false
+        } else {
+            contained_ngram_counts[cur_paragraph] as f64 / total_ngram_counts[cur_paragraph] as f64 >= filtering_threshold
+        };
+        if to_remove {
+            // If we should remove, keep track of duplicate spans
+            duplicate_spans.push(vec![newlines[cur_paragraph], newlines[cur_paragraph + 1]]);
+        } else {
+            // If we should NOT remove, add to new text, and insert hsahes into bloom filter
+            output_text.push_str(&text[newlines[cur_paragraph]..newlines[cur_paragraph+1]]);
+            for hash in &total_ngram_hashes[cur_paragraph] {
+                if !no_update_bloom_filter {
+                    bloom_filter.insert_hashes(&hash);
+                }
+            }
+        }
+
+        // And then handle the extra things to delete:
+        while overflow_idxs.len() > 0 {
+
+            let cur_overflow = overflow_idxs[overflow_idxs.len() - 1];
+            let cur_hash = &overflow_hashes[overflow_hashes.len() - 1];
+            // If fully preceding current then it has survived thusfar and should be added in and we should be done processing
+            if cur_overflow.1 < newlines[cur_paragraph] {
+                if !no_update_bloom_filter {
+                    bloom_filter.insert_hashes(cur_hash);
+                }
+                overflow_idxs.pop();
+                overflow_hashes.pop();
+            } else { // intersects
+                if to_remove {
+                    overflow_idxs.pop();
+                    overflow_hashes.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Anything left in the overflow survived to the end and should kept? 
+    while overflow_hashes.len() > 0 {
+        let cur_hash = overflow_hashes.pop().unwrap();
+        if !no_update_bloom_filter {
+            bloom_filter.insert_hashes(&cur_hash);
+        }
+    }
+
+
+
+    // And then finally make the output 
+    if annotate {
+        data["bff_duplicate_spans"] = serde_json::to_value(duplicate_spans).unwrap();
+        data["bff_contained_ngram_count"] = total_contains.into();
+    } else {
+        data["text"] = Value::String(output_text.trim_end().to_string());
+    }   
+
+    (data, total_bytes - output_text.len() as usize, total_bytes as usize)
+
 }
 
 

@@ -12,6 +12,7 @@ use std::clone::Clone;
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
+use std::cmp;
 use std::io::{BufRead, BufReader, BufWriter, Write, Cursor};
 use std::mem::size_of;
 use std::path::{PathBuf};
@@ -184,6 +185,7 @@ enum RemoveType {
     /// Does exact removal (it's not _really_ exact, shhh....)
     Exact,
 
+
 }
 
 
@@ -205,6 +207,125 @@ fn tokenize_indices(s: &str) -> impl Iterator<Item = (usize, &str)> {
     s.split_word_bound_indices().filter(|(_, w)| {not_whitespace(w)})
 }
 
+
+fn merge_intervals(mut v: Vec<(usize, usize)>, already_sorted: bool) -> Vec<(usize, usize)>{    
+    if !already_sorted {
+        v.sort_by_key(|(key, _)| key.clone());
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in v {
+        if merged.len() == 0 {
+            merged.push((s, e));
+        } else if merged.last().unwrap().1 >= s {
+            let (old_s, old_e) = merged.pop().unwrap();
+            merged.push((old_s, cmp::max(e, old_e)));
+        } else {
+            merged.push((s, e));
+        }
+    }
+    merged
+}
+
+fn merge_sorted_interval_pair(u: Vec<(usize, usize)>, w: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    // Given two sorted lists of intervals, does a merge of the pairs, and then unions all intervals
+    let mut v : Vec<(usize, usize)> = Vec::new();
+    let mut ui = 0;
+    let mut wi = 0;
+    while ui < u.len() && wi < w.len() {
+        let (us, ue) = u[ui];
+        let (ws, we) = w[wi];
+        if us < ws || (us == ws && ue <= we){
+            v.push((us, ue));
+            ui += 1;
+        } else {
+            v.push((ws, we));
+            wi += 1
+        } 
+    }
+    while ui < u.len() {
+        v.push(u[ui]);
+        ui += 1;
+    }
+
+    while wi < w.len() {
+        v.push(w[wi]);
+        wi += 1;
+    }
+
+    merge_intervals(v, true)
+}
+
+
+
+fn invert_intervals(mut v: Vec<(usize, usize)>, already_sorted: bool, max_len: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    // Returns both (regular, inverted) intervals 
+    // (inverted intervals are all the "gaps")
+    // i.e., for a list of range 10, the inverse of [(0,4) (6, 8)] -> [(4,6), (8,10)]
+    if !already_sorted {
+        v.sort_by_key(|(key, _)| key.clone());
+    }
+    let mut inv_intervals : Vec<(usize, usize)> = Vec::new();
+    if v.len() == 0 {
+        inv_intervals.push((0,  max_len));
+        return (v, inv_intervals);
+    }
+
+    if v.first().unwrap().0 > 0 {
+        inv_intervals.push((0, v.first().unwrap().0));
+    }
+    for window in v.windows(2) {
+        let (_, e0) = window[0];
+        let (s1, _) = window[1];
+        inv_intervals.push((e0, s1));
+    }
+    if v.last().unwrap().1 < max_len {
+        inv_intervals.push((v.last().unwrap().1, max_len));
+    }
+    (v, inv_intervals)
+}
+
+
+fn fuzzy_sandwich_intervals(v: &Vec<(usize, usize)>, foward: bool, threshold: f64) -> Vec<(usize, usize)> {
+    // Given SORTED list of DISJOINT intervals, scans in the forward/!forward direction
+    // And collects all intervals that: 
+    // 1. Start and end at an interval
+    // 2. Have >=threshold of the range contained in an input interval
+    // e.g. [(0,9), (10, 20)] -> [(0,20)] (when the threshold is <=0.95)
+
+    let n = v.len();
+    let iter_range : Vec<_> = if foward {
+        (0..n).collect()
+    } else {
+        (0..n).rev().collect()
+    };
+    let mut output : Vec<(i32, i32, i32)> = Vec::new();
+    for idx in iter_range {
+
+        let (next_s, next_e) = v[idx];
+        let next_s = next_s as i32;
+        let next_e = next_e as i32;
+
+        if output.len() == 0 {
+            output.push((next_s, next_e, next_e - next_s));
+            continue;
+        }
+        let (cur_s, cur_e, cur_w) = output.last().unwrap();
+        let new_interval = (cmp::min(next_s, *cur_s as i32), 
+                            cmp::max(next_e, *cur_e as i32), 
+                            *cur_w  as i32 + next_e - next_s);
+        if new_interval.2 as f64 >= (new_interval.1 - new_interval.0) as f64 * threshold {
+            output.pop().unwrap();
+            output.push(new_interval);
+        } else {
+            output.push((next_s, next_e, next_e - next_s));
+        }
+    }
+
+    output
+        .iter()
+        .map(|(a,b, _)| (*a as usize, *b as usize))
+        .collect()
+}
 
 
 /*=============================================================
@@ -562,8 +683,8 @@ async fn process_file(
                 process_line_exact(&line, &bloom_filter, no_update_bloom_filter, annotate)
             }
             RemoveType::Substring => {
-                process_line_substring(&line, &bloom_filter, max_ngram_size,
-                                   no_update_bloom_filter, annotate, substr_seqlen)                
+                process_line_substring2(&line, &bloom_filter, max_ngram_size,
+                                   no_update_bloom_filter, annotate, substr_seqlen, filtering_threshold)
             }
             RemoveType::Both => {
                 // Dumb version: check if document should be removed
@@ -875,6 +996,118 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
 
     (data, total_bytes - output_str.len() as usize, total_bytes as usize)
 }
+
+
+
+
+fn process_line_substring2(line: &String, bloom_filter: &BloomFilter, max_ngram_size: usize,
+                           no_update_bloom_filter: bool, annotate: bool, substr_seqlen: usize, 
+                           fuzzy_threshold: f64) -> 
+    (serde_json::Value, usize, usize) {
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let text = data["text"].as_str().unwrap();
+    let mut total_tokens: usize = 0;
+    let total_bytes = text.len();
+
+    // Step 1: Get contained ngram indices, and map from ngram/token idx -> text idx
+    let mut hashes : Vec<Vec<u64>> = Vec::new(); // Note: hashes[i] is the hash of tokens[i..i + max_ngram_size]
+    let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size); // temp thing to get hashes
+    let mut tokenidx2textidx: Vec<usize> = Vec::new(); // token_idx -> text idx
+
+    let mut debug_tokens : Vec<&str> = Vec::new();
+    for (text_idx, token) in tokenize_indices(text) {
+        debug_tokens.push(token);
+        total_tokens += 1;
+        tokenidx2textidx.push(text_idx);
+        ngram.push_back(token);
+        if ngram.len() >= max_ngram_size {
+            let cur_hash = bloom_filter.hashes(&ngram);
+            hashes.push(cur_hash.clone());
+            // Wild idea: what if we pushed ALL ngram hashes to bloom filter?
+            // bloom_filter.insert_hashes(&cur_hash);
+            ngram.pop_front();
+        }
+    }
+    if hashes.len() == 0 { // Too short of document, do nothing, return early
+        return (data, 0, total_tokens);
+    }
+    tokenidx2textidx.push(text.len()); // bookend 
+    // UPDATE 
+    // Get hash intervals that are contained -- actual intervals, so semiopen like [)
+    let mut contained_hash_ranges : Vec<(usize, usize)> = Vec::new();
+    let mut contained_ngram_count = 0;
+    for (idx, hash) in hashes.iter().enumerate() {
+        let contain = bloom_filter.contains_hashes(hash);
+        if !contain { continue; }
+        contained_ngram_count += 1;
+        if contained_hash_ranges.len() > 0 && contained_hash_ranges.last().unwrap().1 == idx {
+            let (start, _) = contained_hash_ranges.pop().unwrap();
+            contained_hash_ranges.push((start, idx + 1));
+        } else {
+            contained_hash_ranges.push((idx, idx+1))
+        }
+    }
+
+    // And then convert hash ranges to token intervals, merge, filter out short tokens, and get to_keep intervals
+    let contained_token_intervals : Vec<(usize, usize)> = contained_hash_ranges.iter()
+        .map(|(s, e)| (*s, e + max_ngram_size - 1))
+        .collect();
+
+    let contained_token_intervals = merge_intervals(contained_token_intervals, true);
+    let contained_token_intervals = if fuzzy_threshold < 1.0 {
+        // Do fuzzy thing
+        let forward_fuzzy = fuzzy_sandwich_intervals(&contained_token_intervals, true, fuzzy_threshold);
+        let backward_fuzzy = fuzzy_sandwich_intervals(&contained_token_intervals, false, fuzzy_threshold);
+        merge_sorted_interval_pair(forward_fuzzy, backward_fuzzy)
+    } else {
+        contained_token_intervals
+    };
+
+    let contained_token_intervals : Vec<(usize, usize)> = contained_token_intervals
+        .into_iter()
+        .filter(|(s, e)| e-s >= substr_seqlen)
+        .collect();
+
+    let (contained_token_intervals, noncontained_token_intervals) = invert_intervals(contained_token_intervals, true, total_tokens);
+    // Add hashes in to bloom filter
+    if !no_update_bloom_filter {
+        for (s,e) in &noncontained_token_intervals {
+            let mut hash_idx = *s;
+            let mut ngram_end = s + max_ngram_size;
+            while ngram_end <= *e {
+                bloom_filter.insert_hashes(&hashes[hash_idx]);
+                hash_idx += 1;
+                ngram_end += 1;
+            }
+        }
+    }
+
+    // For the noncontained_token_intervals, map to text indices
+    let contained_text_intervals: Vec<(usize, usize)> = contained_token_intervals
+        .into_iter()
+        .map(|(s,e)| (tokenidx2textidx[s], tokenidx2textidx[e]))
+        .collect();
+    let noncontained_text_intervals: Vec<(usize, usize)> = noncontained_token_intervals
+        .into_iter()
+        .map(|(s, e)| (tokenidx2textidx[s], tokenidx2textidx[e]))
+        .collect();
+
+    let mut output_str = String::new();
+    for (s, e) in noncontained_text_intervals {
+        output_str.push_str(&text[s..e]);
+    }
+
+    if annotate {
+        data["bff_duplicate_spans"] = serde_json::to_value(contained_text_intervals).unwrap();
+        data["bff_contained_ngram_count"] = serde_json::to_value(contained_ngram_count).unwrap();
+    } else {
+        data["text"] = Value::String(output_str.trim_end().to_string());    
+    }
+    (data, total_bytes - output_str.len(), total_bytes as usize)
+
+}
+
+
 
 
 fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size: usize,
@@ -1218,7 +1451,7 @@ async fn get_reader_from_s3(path: &PathBuf, num_retries: Option<usize>) -> Resul
     let body_stream = object.body.into_async_read();
     let mut data = Vec::new();
 
-    if path.extension().unwrap() == "zstd" {
+    if (path.extension().unwrap() == "zstd") || (path.extension().unwrap() == "zst") {
         let zstd = asyncZstd::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");

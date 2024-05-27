@@ -41,6 +41,7 @@ use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 use async_compression::tokio::bufread::ZstdDecoder as asyncZstd;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 
 #[derive(Parser)]
@@ -667,7 +668,6 @@ async fn process_file(
 
     // If output file is local, write directly to file
     let mut output_data: Vec<u8> = Vec::new();
-    let mut writer = BufWriter::with_capacity(1024 * 1024, GzEncoder::new(Cursor::new(&mut output_data), Compression::default()));
 
 
     // Loop over lines and do bff stuff
@@ -683,7 +683,7 @@ async fn process_file(
                 process_line_exact(&line, &bloom_filter, no_update_bloom_filter, annotate)
             }
             RemoveType::Substring => {
-                process_line_substring2(&line, &bloom_filter, max_ngram_size,
+                process_line_substring(&line, &bloom_filter, max_ngram_size,
                                    no_update_bloom_filter, annotate, substr_seqlen, filtering_threshold)
             }
             RemoveType::Both => {
@@ -726,15 +726,13 @@ async fn process_file(
             fully_skipped += 1
         }
         else {
-            serde_json::to_writer(&mut writer, &dedup_data)?;
-            writer.write_all(b"\n")?;             
+            output_data.extend(serde_json::to_vec(&dedup_data).unwrap());
+            output_data.extend(b"\n");         
         }        
     }
 
     // Handle output files
-    writer.flush()?;
-    let encoder = writer.into_inner().expect("Failed to get encoder");
-    encoder.finish().unwrap();
+    let output_data = compress_data(output_data, &output_file);
     if fully_skipped < count {
         if is_s3(output_file) {
             let (output_bucket, output_key) = split_s3_path(output_file);
@@ -881,126 +879,6 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
 
 
 fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_size: usize,
-                           no_update_bloom_filter: bool, annotate: bool, substr_seqlen: usize) -> 
-    (serde_json::Value, usize, usize) {
-    let mut data: Value = serde_json::from_str(&line).unwrap();
-    let text = data["text"].as_str().unwrap();
-    let mut total_tokens: i32 = 0;
-
-    let total_bytes = text.len();
-    //println!("{}", "-".repeat(100));
-    //println!("LINE IS {:?}", line);
-    //println!("Text length is {}", text.len());
-    // Step 1: Get contained ngram indices, and map from ngram/token idx -> text idx
-    let mut hashes : Vec<Vec<u64>> = Vec::new(); // Note: hashes[i] is the hash of tokens[i..i + max_ngram_size]
-    let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
-    let mut tokenidx2textidx: Vec<usize> = Vec::new();
-
-    let mut debug_tokens : Vec<&str> = Vec::new();
-    for (text_idx, token) in tokenize_indices(text) {
-        debug_tokens.push(token);
-        total_tokens += 1;
-        tokenidx2textidx.push(text_idx);
-        ngram.push_back(token);
-        if ngram.len() >= max_ngram_size {
-            hashes.push(bloom_filter.hashes(&ngram));
-            ngram.pop_front();
-        }
-    }
-    if hashes.len() == 0 { // Too short of document, do nothing, return early
-        return (data, 0, total_tokens as usize);
-    }
-
-
-    tokenidx2textidx.push(text.len());
-    //println!("TOKENS {:?}", debug_tokens);
-    //println!("TOKENS2IDX {:?}", tokenidx2textidx);
-    let contained_ngram_idxs: Vec<i32> = hashes // idxs are TOKEN/NGRAM indices
-        .iter()
-        .enumerate()
-        .filter(|(_, hash)| bloom_filter.contains_hashes(hash))
-        .map(|(i, _)| i as i32)
-        .collect();
-    let bff_contained_ngram_count = contained_ngram_idxs.len();
-
-    //println!("CONTAINED {:?}", contained_ngram_idxs);
-    // Step 2: Collect groups of contained ngrams of length >= substr_seqlen tokens
-    // We'll keep track of spans of tokens of length at least substr_seqlen in the to_remove_token_ranges object
-    // This has [token_start, token_end] (INCLUSIVE) ranges of long-enough spans of seen tokens
-    // AND is bookended by (-1,-1), (#tokens, #tokens)
-    let remove_grouplen = (substr_seqlen - max_ngram_size + 1) as i32; 
-    let mut to_remove_token_ranges : Vec<(i32, i32)> = Vec::new(); // ranges of TOKEN indices to remove, i.e. [start,end] INCLUSIVE
-    let mut cur_group : (i32, i32) = (-1, -1); 
-    to_remove_token_ranges.push(cur_group); // bookend LEFT
-    for idx in &contained_ngram_idxs {
-        let idx = *idx;
-        if cur_group == (-1, -1) { // special case for first group
-            cur_group = (idx, idx);
-        } else if cur_group.1 == idx -1 { // continue growing the current group
-            cur_group = (cur_group.0, idx);
-        } else { // need to start a new group
-            //println!("STARTING NEW GROUP {:?}", cur_group);
-            if cur_group.1 - cur_group.0 >= remove_grouplen -1 { // if current group long enough, save it
-                to_remove_token_ranges.push((cur_group.0, cur_group.1 + max_ngram_size as i32 -1 ));
-            }
-            cur_group = (idx, idx); // start a new group
-        }
-    }
-    //println!("OUTPUT CUR GROUP {:?}", cur_group);
-    if cur_group.1 - cur_group.0 >= remove_grouplen -1 { // final group (if long enough)
-        to_remove_token_ranges.push((cur_group.0, cur_group.1 + max_ngram_size as i32 - 1));
-    }
-    to_remove_token_ranges.push((total_tokens as i32, total_tokens as i32)); // bookend RIGHT
-    //println!("TO REMOVE RANGES {:?}", to_remove_token_ranges);
-
-
-    // Step 3: 
-    // Since we have inclusive ranges of the tokens we remove, we can get ranges of tokens we keep by .windows(2)
-    // So we create token-to-keep intervals for which pieces of text to push to output 
-    // AND ngram-to-add indices for ngrams that remain here
-    let mut output_str = String::new();
-    for window in to_remove_token_ranges.windows(2) { // windows indicate the NOT_REMOVED tokens
-
-        let tok_start = window[0].1 + 1;// also the ngram start
-        let tok_end = window[1].0;
-        let ngram_end = tok_end - max_ngram_size as i32 + 1;
-        //println!("ADDING IN TOKENS [{:?})", (tok_start, tok_end));
-        //println!("ADDING IN NGRAMS [{:?})", (tok_start, ngram_end));
-        //println!("KEEP RANGE {:?} {:?}", tok_start, tok_end);
-        if tok_end <= tok_start {
-            continue;
-        }        
-
-        if !no_update_bloom_filter {
-            for ngram_idx in tok_start..ngram_end { // Add ngrams
-                bloom_filter.insert_hashes(&hashes[ngram_idx as usize]);
-            }
-        }
-        // And then push the text to output
-        output_str.push_str(&text[tokenidx2textidx[tok_start as usize]..tokenidx2textidx[tok_end as usize]]);
-    }
-    //println!("OUTPUT STR {:?}", output_str);
-    if annotate {
-        // Spans here are like [lo,hi) ... i.e. semi-open intervals
-        let mut duplicate_char_spans : Vec<(usize, usize)> = Vec::new();
-        for i in 1..to_remove_token_ranges.len() - 1 {
-            let (s, e) = to_remove_token_ranges[i];
-            duplicate_char_spans.push((tokenidx2textidx[s as usize], tokenidx2textidx[e as usize + 1]));
-        }
-
-        data["bff_duplicate_spans"] = serde_json::to_value(duplicate_char_spans).unwrap();
-        data["bff_contained_ngram_count"] = serde_json::to_value(bff_contained_ngram_count).unwrap();
-    } else {
-        data["text"] = Value::String(output_str.trim_end().to_string());
-    }
-
-    (data, total_bytes - output_str.len() as usize, total_bytes as usize)
-}
-
-
-
-
-fn process_line_substring2(line: &String, bloom_filter: &BloomFilter, max_ngram_size: usize,
                            no_update_bloom_filter: bool, annotate: bool, substr_seqlen: usize, 
                            fuzzy_threshold: f64) -> 
     (serde_json::Value, usize, usize) {
@@ -1347,6 +1225,7 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     // Note that this function is async because we need to wait for all the s3 files to get expanded
     // Also note that the output vector is SORTED (in case S3 has inconsistent list_objects_v2 ordering)
     let mut files: Vec<PathBuf> = Vec::new();
+    let suffices = vec![".gz", "", ".zstd", ".zstd"];
     for path in paths {
         if is_s3(path) {
             let s3_result = expand_s3_dirs(path).await?;
@@ -1357,9 +1236,12 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             let path_str = path
                 .to_str()
                 .ok_or_else(|| anyhow!("invalid path '{}'", path.to_string_lossy()))?;
-            for entry in glob(&format!("{}/**/*.json*.gz", path_str))? {
-                files.push(entry?.to_path_buf());
+            for suffix in &suffices {
+                for entry in glob(&format!("{}/**/*.jsonl{}", path_str, suffix))? {
+                    files.push(entry?.to_path_buf());
+                }
             }
+
         } else {
             files.push(path.clone());
         }
@@ -1393,7 +1275,7 @@ async fn expand_s3_dirs(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
             Ok(output) => {
                 for object in output.contents() {
                     let key = object.key().unwrap();
-                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".json.gz") || key.ends_with(".jsonl.zstd")) {
+                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".jsonl") || key.ends_with(".jsonl.zstd") || key.ends_with(".jsonl.zst")) {
                         continue;
                     }
                     let mut s3_file = PathBuf::from("s3://");
@@ -1455,11 +1337,15 @@ async fn get_reader_from_s3(path: &PathBuf, num_retries: Option<usize>) -> Resul
         let zstd = asyncZstd::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
-    } else {
+    } else if path.extension().unwrap() == "gz" {
         let gz = asyncGZ::new(body_stream);
         let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
         reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    } else {
+        let mut reader = tBufReader::with_capacity(1024 * 1024, body_stream);
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
     }
+
     let cursor = Cursor::new(data);
     Ok(BufReader::new(cursor))
 }
@@ -1526,6 +1412,28 @@ fn get_output_filename(inputs: &[PathBuf], input_filename: &PathBuf, output_dire
     let relative_path = input_filename.strip_prefix(matching_prefix).unwrap();
     output_directory.clone().join(relative_path)
 
+}
+
+
+fn compress_data(data: Vec<u8>, filename: &PathBuf) -> Vec<u8> {
+    // Given a filename with an extension, compresses a bytestream accordingly 
+    // {zst, zstd} -> zstandard, {gz} -> gzip, anything else -> nothing
+
+
+    let data = match filename.extension().unwrap().to_str() {
+        Some("gz") => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&data).unwrap();            
+            encoder.finish().unwrap()
+        },
+        Some("zstd") | Some("zst") => {
+            let mut encoder = ZstdEncoder::new(Vec::new(), 0).unwrap();
+            encoder.write_all(&data).unwrap();
+            encoder.finish().unwrap()
+        },
+        _ => {data}
+    };
+    data
 }
 
 

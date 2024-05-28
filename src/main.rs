@@ -42,7 +42,7 @@ use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
 use async_compression::tokio::bufread::ZstdDecoder as asyncZstd;
 use zstd::stream::write::Encoder as ZstdEncoder;
-
+use zstd::stream::read::Decoder as ZstDecoder;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -657,13 +657,24 @@ async fn process_file(
         */
         Box::new(get_reader_from_s3(input_file, None).await.unwrap().lines())
     } else {
-
+        let ext = input_file.extension().unwrap().to_str().unwrap();
         let input_file = OpenOptions::new()
             .read(true)
             .write(false)
             .create(false)
             .open(input_file)?;
-        Box::new(BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines())
+
+        match ext {
+            "zstd" | "zst" => {
+                Box::new(BufReader::with_capacity(1024 * 1024, ZstDecoder::new(input_file).unwrap()).lines())
+            }, 
+            "gz" => {
+                Box::new(BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines())                
+            }
+            _ => {
+                Box::new(BufReader::with_capacity(1024 * 1024, input_file).lines()) 
+            }
+        }
     };
 
     // If output file is local, write directly to file
@@ -1225,7 +1236,7 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     // Note that this function is async because we need to wait for all the s3 files to get expanded
     // Also note that the output vector is SORTED (in case S3 has inconsistent list_objects_v2 ordering)
     let mut files: Vec<PathBuf> = Vec::new();
-    let suffices = vec![".gz", "", ".zstd", ".zstd"];
+    let suffices = vec![".gz", "", ".zstd", ".zst"];
     for path in paths {
         if is_s3(path) {
             let s3_result = expand_s3_dirs(path).await?;
@@ -1420,7 +1431,7 @@ fn compress_data(data: Vec<u8>, filename: &PathBuf) -> Vec<u8> {
     // {zst, zstd} -> zstandard, {gz} -> gzip, anything else -> nothing
 
 
-    let data = match filename.extension().unwrap().to_str() {
+    let output_data = match filename.extension().unwrap().to_str() {
         Some("gz") => {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(&data).unwrap();            
@@ -1428,14 +1439,13 @@ fn compress_data(data: Vec<u8>, filename: &PathBuf) -> Vec<u8> {
         },
         Some("zstd") | Some("zst") => {
             let mut encoder = ZstdEncoder::new(Vec::new(), 0).unwrap();
-            encoder.write_all(&data).unwrap();
+            encoder.write_all(&data).unwrap();            
             encoder.finish().unwrap()
         },
         _ => {data}
     };
-    data
+    output_data
 }
-
 
 /*=============================================================
 =                       Main Function                         =

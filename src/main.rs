@@ -35,10 +35,15 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::{Client};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
-use tokio::io::{AsyncBufReadExt};
+use tokio::io::AsyncReadExt;
+
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
 use async_compression::tokio::bufread::GzipDecoder as asyncGZ;
+use async_compression::tokio::bufread::ZstdDecoder as asyncZstd;
+use zstd::stream::write::Encoder as ZstdEncoder;
+
+
 use rayon::prelude::*;
 
 
@@ -627,15 +632,28 @@ async fn process_file_s3(
 
     let object = get_object_with_retry(&client, s3_bucket, s3_input, num_retries).await?;
     let body_stream = object.body.into_async_read();
-    let gz = asyncGZ::new(body_stream);
-    let reader = tBufReader::with_capacity(1024 * 1024, gz);
-    let mut lines_iter = reader.lines();
+
+    let mut data = Vec::new();
+    let input_ext = s3_input.rsplit('.').next().unwrap();
+    if (input_ext == "zstd") || (input_ext == "zst") {
+        let zstd = asyncZstd::new(body_stream);
+        let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    } else if input_ext == "gz" {
+        let gz = asyncGZ::new(body_stream);
+        let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    } else {
+        let mut reader = tBufReader::with_capacity(1024 * 1024, body_stream);
+        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
+    }
+    let cursor = Cursor::new(data);
+    let lines_iter = BufReader::new(cursor).lines();
+
+
 
     // Phase 1c: Setup output buffer to upload->s3 eventually...
     // TODO: Make output writer streaming too?
-    let mut output_data = Vec::new();
-    let encoder = GzEncoder::new(Cursor::new(&mut output_data), Compression::default());
-    let mut buf_writer = BufWriter::with_capacity(1024 * 1024, encoder);
 
 
     // Phase 2: Loop over lines, process each line, and write it if not fully eradicated
@@ -643,7 +661,9 @@ async fn process_file_s3(
     let mut fully_skipped = 0;
     let mut removed_items = 0;
     let mut total_items = 0;
-    while let Some(line) = lines_iter.next_line().await? {
+    let mut output_data: Vec<u8> = Vec::new();
+    for line in lines_iter {
+        let line = line?;
         count += 1;
         let (dedup_data, removed_line_items, total_line_items) = process_line(&line.to_string(), &bloom_filter, &bff_args);
         removed_items += removed_line_items;
@@ -652,8 +672,8 @@ async fn process_file_s3(
             fully_skipped += 1;
         }
         else {
-            serde_json::to_writer(&mut buf_writer, &dedup_data)?;
-            buf_writer.write_all(b"\n")?;          
+            output_data.extend(serde_json::to_vec(&dedup_data).unwrap());
+            output_data.extend(b"\n");        
         }
         
     }
@@ -661,10 +681,7 @@ async fn process_file_s3(
 
 
     // Phase 3: to finalize, write to s3 if there's something to write
-    buf_writer.flush()?;
-    let encoder = buf_writer.into_inner().expect("Failed to get encoder");
-    encoder.finish().unwrap();
-
+    let output_data = compress_data(output_data, s3_output);
     if fully_skipped < count {
         let bytes_to_upload = ByteStream::from(output_data);
         client
@@ -883,7 +900,7 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
                         break 'outer;
                     }
                     let input_key = object.key().unwrap();
-                    if !(input_key.ends_with(".jsonl.gz") || input_key.ends_with(".json.gz")) {
+                    if !(input_key.ends_with(".jsonl.gz") || input_key.ends_with(".json.gz") || input_key.ends_with(".jsonl.zstd") || input_key.ends_with(".jsonl.zst")) {
                         continue;
                     }
                     let basename = extract_s3_basename(&input_key);
@@ -910,6 +927,27 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
     shard.shuffle(&mut rng);
 
     Ok(shard)
+}
+
+fn compress_data(data: Vec<u8>, filename: &String) -> Vec<u8> {
+    // Given a filename with an extension, compresses a bytestream accordingly 
+    // {zst, zstd} -> zstandard, {gz} -> gzip, anything else -> nothing
+    let ext = filename.rsplit('.').next().unwrap();
+
+    let output_data = match ext {
+        "gz" => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&data).unwrap();            
+            encoder.finish().unwrap()
+        },
+        "zstd" | "zst" => {
+            let mut encoder = ZstdEncoder::new(Vec::new(), 0).unwrap();
+            encoder.write_all(&data).unwrap();            
+            encoder.finish().unwrap()
+        },
+        _ => {data}
+    };
+    output_data
 }
 
 

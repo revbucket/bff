@@ -929,6 +929,22 @@ async fn gather_s3_io(bucket: &str, prefix: &str, output_dir: &str, subset: &Opt
     Ok(shard)
 }
 
+
+fn get_output_filename(inputs: &[PathBuf], input_filename: &PathBuf, output_directory: &PathBuf) -> PathBuf {
+    // More fancy output-file naming that no longer assumes unique inputs
+    let matching_prefix = inputs
+        .iter()
+        .find(|pfx| input_filename.starts_with(pfx))
+        .expect("No matching prefix found?!?");
+
+    let relative_path = input_filename.strip_prefix(matching_prefix).unwrap();
+    output_directory.clone().join(relative_path)
+
+}
+
+
+
+
 fn compress_data(data: Vec<u8>, filename: &String) -> Vec<u8> {
     // Given a filename with an extension, compresses a bytestream accordingly 
     // {zst, zstd} -> zstandard, {gz} -> gzip, anything else -> nothing
@@ -1037,7 +1053,8 @@ fn bff(inputs: &Vec<PathBuf>, output_directory: &PathBuf, bff_args: &BffArgs) ->
     let threadpool = ThreadPool::new(threads);
     for input in shard {
         //let mut output = output_directory.clone();
-        let output = output_directory.clone().join(input.file_name().unwrap());
+        let output = get_output_filename(inputs, &input, output_directory);
+        //let output = output_directory.clone().join(input.file_name().unwrap());
         //output.push(input.file_name().unwrap());
         let bloom_filter = bloom_filter.clone();
         let bff_args = bff_args.clone();

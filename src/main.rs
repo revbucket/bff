@@ -180,6 +180,9 @@ enum RemoveType {
     /// Warning: There are some SUBTLE differences between the output of RemoveType::Both and RemoveType::NaiveBoth, 
     NaiveBoth,
 
+    /// Both as we did it in dabv3
+    OldBoth,
+
     /// Does substring style removal
     Substring,
 
@@ -713,7 +716,13 @@ async fn process_file(
                 } 
                 */
                     
+            },
+            RemoveType::OldBoth => {
+                process_line_oldboth(&line, &bloom_filter, min_ngram_size, max_ngram_size,
+                                     filtering_threshold, no_update_bloom_filter, annotate)
             }
+
+
             RemoveType::NaiveBoth => {
                 let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
@@ -1190,6 +1199,119 @@ fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: 
     (data, total_bytes - output_text.len() as usize, total_bytes as usize)
 
 }
+
+
+
+
+fn process_line_oldboth(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size:usize, 
+                        filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool) 
+    -> (serde_json::Value, usize, usize){
+    let mut data: Value = serde_json::from_str(&line).unwrap();
+    let mut total_items = 0;
+    let mut removed_items = 0;
+    let text = data["text"].as_str().unwrap();
+
+
+    let newlines = if false {
+        vec![0, text.len()]
+    } else {
+        let mut newlines = Vec::new();
+        newlines.push(0);
+        for i in text.match_indices('\n') {
+            newlines.push(i.0);
+        }
+        newlines.push(text.len());
+        newlines
+    };
+    let mut windows_to_remove = Vec::new();
+
+    let mut total_ngrams = 0;
+    let mut total_contained_ngrams = 0;
+    for paragraph_window in newlines.windows(2) {
+        let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
+        total_items += 1;
+
+        // calculate hashes for the paragraph
+        let mut hashes: Vec<Vec<u64>> = Vec::new();
+        let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
+        for token in tokenize(paragraph) {
+            ngram.push_back(token);
+            // If not hashing whole paragraphs, add ngrams to the bloom filter as they reach max size
+            if ngram.len() >= max_ngram_size {
+                hashes.push(bloom_filter.hashes(&ngram));
+                ngram.pop_front();
+            }
+        }
+
+        // If the paragraph was too short, put in a shorter ngram, so we can dedupe short
+        // paragraphs exactly.
+        if hashes.is_empty() && ngram.len() >= min_ngram_size {
+            hashes.push(bloom_filter.hashes(&ngram));
+        }
+
+        let contained_ngrams = hashes
+            .iter()
+            .filter(|ngram| bloom_filter.contains_hashes(ngram))
+            .count();
+        total_ngrams += hashes.len();
+        total_contained_ngrams += contained_ngrams;
+
+        // calculate how many ngrams are in the bloom filter
+        let number_of_ngrams = hashes.len();
+
+        // produce output
+        let too_many_duplicate_ngrams =
+            contained_ngrams as f64 / number_of_ngrams as f64 > filtering_threshold;
+        if too_many_duplicate_ngrams {
+            windows_to_remove.push(paragraph_window);
+            removed_items += 1;
+        } else if !no_update_bloom_filter {
+            for ngram in hashes {
+                bloom_filter.insert_hashes(&ngram);
+            }
+        }
+    }
+
+    // if annotate_attribute_only or annotate_only, add the annotation to the json
+    if annotate {
+        data["bff_duplicate_spans"] = serde_json::to_value(windows_to_remove).unwrap();
+        data["bff_contained_ngram_count"] =
+            serde_json::to_value(total_contained_ngrams).unwrap();
+    } else {
+        let mut output_paragraphs = String::new();
+        let mut last_end = 0;
+        for paragraph_window in windows_to_remove {
+            output_paragraphs.push_str(&text[last_end..paragraph_window[0]]);
+            last_end = paragraph_window[1];
+        }
+        output_paragraphs.push_str(&text[last_end..]);
+        if (total_contained_ngrams as f64) / (total_ngrams as f64) > filtering_threshold {
+            output_paragraphs = String::new(); // If we found enough duplicates to remove whole document too
+        }
+        data["text"] = Value::String(output_paragraphs);
+        data["bff_contained_ngram_count_before_dedupe"] =
+            serde_json::to_value(total_contained_ngrams).unwrap();
+    }
+
+    if annotate {
+        // Allowed fields
+        let allowed_fields = [
+            "bff_duplicate_spans",
+            "bff_contained_ngram_count",
+            "id",
+            "source",
+            "text"
+        ];
+
+        // Iterate through the keys of the JSON object and remove any field that is not in the allowed_fields list
+        if let Value::Object(ref mut map) = data {
+            map.retain(|key, _| allowed_fields.contains(&key.as_str()));
+            }
+    }
+    (data, removed_items, total_items)
+}
+
+
 
 
 fn process_line_exact(line: &String, bloom_filter: &BloomFilter, no_update_bloom_filter: bool, annotate: bool) ->

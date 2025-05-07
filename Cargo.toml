@@ -21,8 +21,6 @@ indicatif = "0.17.8"
 glob = "0.3.1"
 anyhow = "1.0.80"
 tokio = { version = "1.36.0", features = ["full"] }
-aws-config = "1.1.8"
-aws-sdk-s3 = "1.19.1"
 async-compression = {version ="0.4.6", features=["all"]}
 rayon = "1.10.0"
 zstd = "0.13.1"

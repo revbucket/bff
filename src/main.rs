@@ -31,11 +31,7 @@ use std::sync::{Arc, Mutex};
 use indicatif::{ProgressBar,ProgressStyle};
 use std::time::{Instant};
 
-use aws_config::meta::region::RegionProviderChain;
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::{Client};
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::operation::get_object::GetObjectOutput;
+
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader as tBufReader;
 use tokio::time::{Duration, sleep};
@@ -658,7 +654,7 @@ async fn process_file(
             .open(input_file)?;
         BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines()        
         */
-        Box::new(get_reader_from_s3(input_file, None).await.unwrap().lines())
+        panic!("No S3 support!");
     } else {
         let ext = input_file.extension().unwrap().to_str().unwrap();
         let input_file = OpenOptions::new()
@@ -755,15 +751,7 @@ async fn process_file(
     let output_data = compress_data(output_data, &output_file);
     if fully_skipped < count {
         if is_s3(output_file) {
-            let (output_bucket, output_key) = split_s3_path(output_file);
-            let client = get_s3_client().await;
-            let _ = client
-                .put_object()
-                .bucket(output_bucket)
-                .key(output_key)
-                .body(ByteStream::from(output_data))
-                .send()
-                .await;            
+            panic!("NO S3 SUPPORT");
         } else {
             let mut output_file = OpenOptions::new()
                 .read(false)
@@ -1361,10 +1349,7 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let suffices = vec![".gz", "", ".zstd", ".zst"];
     for path in paths {
         if is_s3(path) {
-            let s3_result = expand_s3_dirs(path).await?;
-            for file in s3_result {
-                files.push(file.clone());
-            }
+            panic!("No s3 support~");
         } else if path.is_dir() {
             let path_str = path
                 .to_str()
@@ -1384,104 +1369,6 @@ async fn expand_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 
-
-async fn expand_s3_dirs(s3_uri: &PathBuf) -> Result<Vec<PathBuf>> {
-    let mut s3_files: Vec<PathBuf> = Vec::new();
-
-    let (bucket, prefix) = split_s3_path(s3_uri);
-    let region_provider = RegionProviderChain::default_provider();
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-    let client = Client::new(&config);
-
-    let mut response = client
-        .list_objects_v2()    
-        .bucket(bucket.to_owned())
-        .prefix(prefix.to_owned())
-        .into_paginator()
-        .send();
-
-    while let Some(result) = response.next().await {
-        match result {
-            Ok(output) => {
-                for object in output.contents() {
-                    let key = object.key().unwrap();
-                    if !(key.ends_with(".jsonl.gz") || key.ends_with(".jsonl") || key.ends_with(".jsonl.zstd") || key.ends_with(".jsonl.zst")) {
-                        continue;
-                    }
-                    let mut s3_file = PathBuf::from("s3://");
-                    s3_file.push(bucket.clone());
-                    s3_file.push(key);
-                    s3_files.push(s3_file);
-                }
-            }
-            Err(err) => {
-                eprintln!("Error collecting S3 files | {err:?}")
-            }
-        }
-    }
-    Ok(s3_files)
-}
-
-
-async fn get_object_with_retry(bucket: &str, key: &str, num_retries: usize) -> Result<GetObjectOutput, aws_sdk_s3::Error> {
-    let mut attempts = 0;
-    let base_delay = Duration::from_millis(100);
-    let max_delay = Duration::from_millis(2000);
-
-    let mut rng = rand::thread_rng();
-    let client = get_s3_client().await;
-    loop {
-        match client.get_object().bucket(bucket).key(key).send().await {
-            Ok(response) => return Ok(response),
-            Err(e) if attempts < num_retries => {
-                // Calculate delay for exponential backoff, add some randomness so multiple threads don't access at the
-                // same time.
-                println!("Error {}/{}: {}", e, attempts, num_retries);
-                let random_delay =  rng.gen_range(Duration::from_millis(0)..Duration::from_millis(1000));
-                let mut exponential_delay = base_delay * 2u32.pow(attempts as u32);
-                if exponential_delay > max_delay {
-                    exponential_delay = max_delay;
-                }
-                sleep(exponential_delay + random_delay).await;
-                attempts += 1;
-            }
-            Err(e) => {
-                println!("Too many errors reading: {}. Giving up.", key);
-                return Err(e.into());
-            }
-        }
-    }
-}
-
-
-
-async fn get_reader_from_s3(path: &PathBuf, num_retries: Option<usize>) -> Result<BufReader<Cursor<Vec<u8>>>>{
-    // Gets all the data from an S3 file and loads it into memory and returns a Bufreader over it
-    let num_retries = num_retries.unwrap_or(5);
-    let (s3_bucket, s3_key) = split_s3_path(path);
-    let object = get_object_with_retry(&s3_bucket, &s3_key, num_retries).await?;
-    let body_stream = object.body.into_async_read();
-    let mut data = Vec::new();
-
-    if (path.extension().unwrap() == "zstd") || (path.extension().unwrap() == "zst") {
-        let zstd = asyncZstd::new(body_stream);
-        let mut reader = tBufReader::with_capacity(1024 * 1024, zstd);
-        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
-    } else if path.extension().unwrap() == "gz" {
-        let gz = asyncGZ::new(body_stream);
-        let mut reader = tBufReader::with_capacity(1024 * 1024, gz);
-        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
-    } else {
-        let mut reader = tBufReader::with_capacity(1024 * 1024, body_stream);
-        reader.read_to_end(&mut data).await.expect("Failed to read data {:path}");
-    }
-
-    let cursor = Cursor::new(data);
-    Ok(BufReader::new(cursor))
-}
 
 fn create_dir_if_not_exists(path: &PathBuf) -> Result<(), std::io::Error> {
     if is_s3(path) {
@@ -1523,15 +1410,6 @@ fn is_s3(path: &PathBuf) -> bool {
     } else {
         false
     }
-}
-
-async fn get_s3_client() -> Client {
-    let region_provider = RegionProviderChain::default_provider();
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-    Client::new(&config)
 }
 
 

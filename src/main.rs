@@ -40,6 +40,9 @@ use async_compression::tokio::bufread::ZstdDecoder as asyncZstd;
 use zstd::stream::write::Encoder as ZstdEncoder;
 use zstd::stream::read::Decoder as ZstDecoder;
 
+use mj_io::{read_pathbuf_to_mem, write_mem_to_pathbuf};
+
+
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct ArgParser {
@@ -645,37 +648,7 @@ async fn process_file(
     // Setup input/output writers
     // If input file is local: can stream pretty easily/robustly
     // If input file is s3: load entire file and split it into thing that implements .lines() iterator
-    let lines : Box<dyn Iterator<Item = Result<String, std::io::Error>>> = if is_s3(input_file) {
-        /*
-        let input_file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(input_file)?;
-        BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines()        
-        */
-        panic!("No S3 support!");
-    } else {
-        let ext = input_file.extension().unwrap().to_str().unwrap();
-        let input_file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(input_file)?;
-
-        match ext {
-            "zstd" | "zst" => {
-                Box::new(BufReader::with_capacity(1024 * 1024, ZstDecoder::new(input_file).unwrap()).lines())
-            }, 
-            "gz" => {
-                Box::new(BufReader::with_capacity(1024 * 1024, MultiGzDecoder::new(input_file)).lines())                
-            }
-            _ => {
-                Box::new(BufReader::with_capacity(1024 * 1024, input_file).lines()) 
-            }
-        }
-    };
-
+ 
     // If output file is local, write directly to file
     let mut output_data: Vec<u8> = Vec::new();
 
@@ -685,7 +658,9 @@ async fn process_file(
     let mut fully_skipped = 0;
     let mut removed_text_bytes = 0;
     let mut total_text_bytes = 0;
-    for line in lines {
+    let contents = read_pathbuf_to_mem(input_file).unwrap();
+
+    for line in contents.lines() {
         let line = line?;
         count += 1;
         let (dedup_data, removed_line_bytes, total_line_bytes) = match *remove_type {
@@ -747,23 +722,10 @@ async fn process_file(
         }        
     }
 
-    // Handle output files
-    let output_data = compress_data(output_data, &output_file);
-    if fully_skipped < count {
-        if is_s3(output_file) {
-            panic!("NO S3 SUPPORT");
-        } else {
-            let mut output_file = OpenOptions::new()
-                .read(false)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(output_file)?;            
-            output_file.write_all(&output_data)?;
-            
-        }
-    }
 
+    if output_data.len() > 0 {
+        write_mem_to_pathuf(&output_data, output_file).unwrap();
+    }
 
     match pbar_option {
         Some(pbar) => {

@@ -724,7 +724,7 @@ async fn process_file(
 
 
     if output_data.len() > 0 {
-        write_mem_to_pathuf(&output_data, output_file).unwrap();
+        write_mem_to_pathbuf(&output_data, output_file).unwrap();
     }
 
     match pbar_option {
